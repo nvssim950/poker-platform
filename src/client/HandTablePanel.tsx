@@ -5,8 +5,11 @@ import {
   determineNextButtonSeat,
   getEligibleSeatsForNewHand,
   getLegalActions,
+  getLivePots,
   getTotalPotChips,
   type HandActionRecord,
+  type HandPot,
+  type HandSeatState,
   type PlayerActionType,
   type Street,
 } from "../shared/handEngine.ts";
@@ -39,6 +42,18 @@ function formatActionSummary(record: HandActionRecord): string {
   }
 }
 
+function formatEligibleSeatList(
+  seatNumbers: readonly number[],
+  seats: readonly HandSeatState[],
+): string {
+  return seatNumbers
+    .map((seatNumber) => {
+      const seat = seats.find((s) => s.seatNumber === seatNumber);
+      return seat ? `Seat ${seatNumber} (${seat.displayName})` : `Seat ${seatNumber}`;
+    })
+    .join(", ");
+}
+
 export function HandTablePanel({
   session,
   viewer,
@@ -52,7 +67,7 @@ export function HandTablePanel({
 }) {
   const [submitting, setSubmitting] = useState(false);
   const [wagerText, setWagerText] = useState("");
-  const [selectedWinners, setSelectedWinners] = useState<number[]>([]);
+  const [selectedWinnersByPot, setSelectedWinnersByPot] = useState<Record<string, number[]>>({});
   const [showActionLog, setShowActionLog] = useState(false);
 
   const hand = session.hand;
@@ -86,14 +101,17 @@ export function HandTablePanel({
     }
   }, [hand?.handNumber, hand?.street, hand?.actingSeatNumber, hand?.actionHistory.length, minWager]);
 
-  const activeShowdownPot =
+  const unresolvedPotIdsKey =
     hand && hand.status === "SHOWDOWN"
-      ? hand.pots.find((p) => p.winnerSeatNumbers === null) ?? null
-      : null;
+      ? hand.pots
+          .filter((p) => p.winnerSeatNumbers === null)
+          .map((p) => p.id)
+          .join(",")
+      : "";
 
   useEffect(() => {
-    setSelectedWinners([]);
-  }, [hand?.handNumber, hand?.status, activeShowdownPot?.id]);
+    setSelectedWinnersByPot({});
+  }, [hand?.handNumber, hand?.status, unresolvedPotIdsKey]);
 
   async function handleStartHand(): Promise<void> {
     onError(null);
@@ -130,14 +148,15 @@ export function HandTablePanel({
     }
   }
 
-  async function handleResolveShowdown(): Promise<void> {
-    if (!activeShowdownPot || selectedWinners.length === 0) return;
+  async function handleResolveShowdown(pot: HandPot): Promise<void> {
+    const winners = selectedWinnersByPot[pot.id] ?? [];
+    if (winners.length === 0) return;
     onError(null);
     setSubmitting(true);
     try {
       const res = await sessionApi.resolveShowdown(
         session.code,
-        { winnerSeatNumbers: selectedWinners, potId: activeShowdownPot.id },
+        { winnerSeatNumbers: winners, potId: pot.id },
         loadSessionTokens(session.code),
       );
       onSessionUpdate(res.session);
@@ -148,10 +167,14 @@ export function HandTablePanel({
     }
   }
 
-  function toggleWinnerSeat(seatNumber: number): void {
-    setSelectedWinners((prev) =>
-      prev.includes(seatNumber) ? prev.filter((n) => n !== seatNumber) : [...prev, seatNumber],
-    );
+  function toggleWinnerSeat(potId: string, seatNumber: number): void {
+    setSelectedWinnersByPot((prev) => {
+      const current = prev[potId] ?? [];
+      const next = current.includes(seatNumber)
+        ? current.filter((n) => n !== seatNumber)
+        : [...current, seatNumber];
+      return { ...prev, [potId]: next };
+    });
   }
 
   const parsedWager = Number(wagerText);
@@ -190,29 +213,21 @@ export function HandTablePanel({
     (isMyTurn || viewer.isHost);
 
   const livePotChips = hand ? getTotalPotChips(hand) : 0;
-
-  const orderedShowdownContenders =
-    hand && activeShowdownPot
-      ? [...activeShowdownPot.eligibleSeatNumbers]
-          .sort(
-            (a, b) =>
-              clockwiseLeftOfButtonOffset(a, hand.buttonSeatNumber, session.config.seatCount) -
-              clockwiseLeftOfButtonOffset(b, hand.buttonSeatNumber, session.config.seatCount),
-          )
-          .map((seatNumber) => hand.seats.find((s) => s.seatNumber === seatNumber))
-          .filter((s): s is NonNullable<typeof s> => s !== undefined)
-      : [];
-
-  const splitPreview =
-    hand && activeShowdownPot && selectedWinners.length > 0
-      ? computePotSplitAwards({
-          potAmountChips: activeShowdownPot.amountChips,
-          winnerSeatNumbers: selectedWinners,
-          buttonSeatNumber: hand.buttonSeatNumber,
-          seatCount: session.config.seatCount,
-          smallestChipStep: session.config.smallestChipStep,
-        })
-      : null;
+  const livePots = hand ? getLivePots(hand) : [];
+  const totalHandPotChips =
+    hand && hand.status === "SHOWDOWN"
+      ? hand.pots.reduce((sum, pot) => sum + pot.amountChips, 0)
+      : livePotChips;
+  const shortAllInLocked =
+    hand !== null &&
+    hand.status === "BETTING" &&
+    actingSeat !== null &&
+    legal !== null &&
+    hand.currentBet > 0 &&
+    actingSeat.hasActedSinceFullRaise &&
+    legal.toCall > 0 &&
+    !legal.canRaise &&
+    actingSeat.chips > legal.toCall;
 
   return (
     <>
@@ -292,7 +307,7 @@ export function HandTablePanel({
                 {hand.status === "SHOWDOWN" ? "Showdown" : STREET_LABELS[hand.street]}
               </h3>
               <div className="pill-row">
-                <span className="pill pill-live">Pot {livePotChips} Chips</span>
+                <span className="pill pill-live">Pot {totalHandPotChips} Chips</span>
                 <span className="pill">BTN Seat {hand.buttonSeatNumber}</span>
                 <span className="pill">
                   SB {hand.sbSeatNumber} / BB {hand.bbSeatNumber}
@@ -337,7 +352,26 @@ export function HandTablePanel({
             </>
           )}
 
-          <div className="seat-list" style={{ marginBottom: canActNow || activeShowdownPot ? "12px" : 0 }}>
+          {hand.status === "BETTING" && livePots.length > 0 && (
+            <div className="pot-list" style={{ marginBottom: "12px" }}>
+              {livePots.map((pot) => (
+                <div key={pot.id} className="pot-card">
+                  <div className="seat-title" style={{ justifyContent: "space-between", width: "100%" }}>
+                    <span>{pot.label}</span>
+                    <span className="pill pill-live">{pot.amountChips} Chips</span>
+                  </div>
+                  <div className="seat-sub">
+                    Eligible: {formatEligibleSeatList(pot.eligibleSeatNumbers, hand.seats)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div
+            className="seat-list"
+            style={{ marginBottom: canActNow || hand.status === "SHOWDOWN" ? "12px" : 0 }}
+          >
             {hand.seats.map((seat) => {
               const isActing =
                 hand.status === "BETTING" && hand.actingSeatNumber === seat.seatNumber;
@@ -367,6 +401,9 @@ export function HandTablePanel({
                       {seat.streetCommittedChips > 0
                         ? ` · Street Bet: ${seat.streetCommittedChips} Chips`
                         : ""}
+                      {seat.totalCommittedChips > seat.streetCommittedChips
+                        ? ` · Total Committed: ${seat.totalCommittedChips} Chips`
+                        : ""}
                     </div>
                   </div>
                 </div>
@@ -381,6 +418,12 @@ export function HandTablePanel({
                   ? `Your Action (Seat ${actingSeat.seatNumber})`
                   : `Host Proxy Action · Seat ${actingSeat.seatNumber} (${actingSeat.displayName})`}
               </div>
+
+              {shortAllInLocked && (
+                <div className="seat-sub" style={{ color: "var(--warn)", marginBottom: "8px" }}>
+                  Short All-In did not reopen raising — Fold or Call only.
+                </div>
+              )}
 
               {(legal.canBet || legal.canRaise) && minWager !== null && maxWager !== null && (
                 <div className="wager-controls">
@@ -498,67 +541,143 @@ export function HandTablePanel({
             </div>
           )}
 
-          {hand.status === "SHOWDOWN" && activeShowdownPot && (
-            <div className="action-bar">
-              <div className="brand-bar" style={{ marginBottom: "8px" }}>
-                <h4 style={{ margin: 0 }}>
-                  {activeShowdownPot.label} · {activeShowdownPot.amountChips} Chips
-                </h4>
-                <span className="pill pill-warn">Select Winner(s)</span>
-              </div>
-              {viewer.isHost ? (
-                <>
-                  <div className="seat-sub" style={{ marginBottom: "8px" }}>
-                    Tap one Seat to award the Pot, or multiple Seats to split (any odd Chip goes
-                    clockwise left of Button Seat {hand.buttonSeatNumber}).
-                  </div>
-                  <div className="seat-list" style={{ marginBottom: "10px" }}>
-                    {orderedShowdownContenders.map((contender) => {
-                      const checked = selectedWinners.includes(contender.seatNumber);
-                      const payout = splitPreview?.get(contender.seatNumber);
-                      return (
+          {hand.status === "SHOWDOWN" && hand.pots.length > 0 && (
+            <div className="pot-list">
+              {hand.pots.map((pot) => {
+                const isResolved = pot.winnerSeatNumbers !== null;
+                const isAutoAwarded = isResolved && pot.eligibleSeatNumbers.length === 1;
+                const potAwards = (hand.result?.awards ?? []).filter((a) => a.potId === pot.id);
+
+                if (isResolved) {
+                  return (
+                    <div key={pot.id} className="pot-card">
+                      <div
+                        className="seat-title"
+                        style={{ justifyContent: "space-between", width: "100%" }}
+                      >
+                        <span>
+                          {pot.label} · {pot.amountChips} Chips
+                        </span>
+                        <span className="pill pill-live">
+                          {isAutoAwarded ? "Auto-Awarded" : "Awarded"}
+                        </span>
+                      </div>
+                      <div className="seat-sub">
+                        Eligible: {formatEligibleSeatList(pot.eligibleSeatNumbers, hand.seats)}
+                      </div>
+                      <div className="seat-sub" style={{ color: "var(--accent)" }}>
+                        {isAutoAwarded
+                          ? `Auto-awarded +${pot.amountChips} Chips to ${formatEligibleSeatList(pot.winnerSeatNumbers ?? [], hand.seats)}`
+                          : potAwards.length > 0
+                            ? potAwards
+                                .map(
+                                  (a) =>
+                                    `Seat ${a.seatNumber} (${a.displayName}) +${a.amountChips} Chips${a.oddChips > 0 ? ` (includes ${a.oddChips} odd Chip(s))` : ""}`,
+                                )
+                                .join(" · ")
+                            : `Winner(s): ${formatEligibleSeatList(pot.winnerSeatNumbers ?? [], hand.seats)}`}
+                      </div>
+                    </div>
+                  );
+                }
+
+                const selected = selectedWinnersByPot[pot.id] ?? [];
+                const orderedContenders = [...pot.eligibleSeatNumbers]
+                  .sort(
+                    (a, b) =>
+                      clockwiseLeftOfButtonOffset(
+                        a,
+                        hand.buttonSeatNumber,
+                        session.config.seatCount,
+                      ) -
+                      clockwiseLeftOfButtonOffset(
+                        b,
+                        hand.buttonSeatNumber,
+                        session.config.seatCount,
+                      ),
+                  )
+                  .map((seatNumber) => hand.seats.find((s) => s.seatNumber === seatNumber))
+                  .filter((s): s is NonNullable<typeof s> => s !== undefined);
+
+                const splitPreview =
+                  selected.length > 0
+                    ? computePotSplitAwards({
+                        potAmountChips: pot.amountChips,
+                        winnerSeatNumbers: selected,
+                        buttonSeatNumber: hand.buttonSeatNumber,
+                        seatCount: session.config.seatCount,
+                        smallestChipStep: session.config.smallestChipStep,
+                      })
+                    : null;
+
+                return (
+                  <div key={pot.id} className="action-bar">
+                    <div className="brand-bar" style={{ marginBottom: "6px" }}>
+                      <h4 style={{ margin: 0 }}>
+                        {pot.label} · {pot.amountChips} Chips
+                      </h4>
+                      <span className="pill pill-warn">Select Winner(s)</span>
+                    </div>
+                    <div className="seat-sub" style={{ marginBottom: "8px" }}>
+                      Eligible: {formatEligibleSeatList(pot.eligibleSeatNumbers, hand.seats)}
+                    </div>
+                    {viewer.isHost ? (
+                      <>
+                        <div className="seat-sub" style={{ marginBottom: "8px" }}>
+                          Tap one Seat to award this Pot, or multiple Seats to split (any odd Chip
+                          goes clockwise left of Button Seat {hand.buttonSeatNumber}).
+                        </div>
+                        <div className="seat-list" style={{ marginBottom: "10px" }}>
+                          {orderedContenders.map((contender) => {
+                            const checked = selected.includes(contender.seatNumber);
+                            const payout = splitPreview?.get(contender.seatNumber);
+                            return (
+                              <button
+                                key={contender.seatNumber}
+                                type="button"
+                                aria-pressed={checked}
+                                className={`seat-card showdown-option ${checked ? "seat-acting" : ""}`}
+                                onClick={() => toggleWinnerSeat(pot.id, contender.seatNumber)}
+                              >
+                                <div className="seat-meta" style={{ textAlign: "left" }}>
+                                  <div className="seat-title">
+                                    <span>
+                                      Seat {contender.seatNumber} · {contender.displayName}
+                                    </span>
+                                    {checked && <span className="pill pill-live">Winner</span>}
+                                  </div>
+                                  {payout && (
+                                    <div className="seat-sub">
+                                      Receives +{payout.amountChips} Chips
+                                      {payout.oddChips > 0
+                                        ? ` (includes ${payout.oddChips} odd Chip(s))`
+                                        : ""}
+                                    </div>
+                                  )}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
                         <button
-                          key={contender.seatNumber}
                           type="button"
-                          className={`seat-card showdown-option ${checked ? "seat-acting" : ""}`}
-                          onClick={() => toggleWinnerSeat(contender.seatNumber)}
+                          className="btn btn-primary"
+                          disabled={submitting || selected.length === 0}
+                          onClick={() => void handleResolveShowdown(pot)}
                         >
-                          <div className="seat-meta" style={{ textAlign: "left" }}>
-                            <div className="seat-title">
-                              <span>
-                                Seat {contender.seatNumber} · {contender.displayName}
-                              </span>
-                              {checked && <span className="pill pill-live">Winner</span>}
-                            </div>
-                            {payout && (
-                              <div className="seat-sub">
-                                Receives +{payout.amountChips} Chips
-                                {payout.oddChips > 0
-                                  ? ` (includes ${payout.oddChips} odd Chip)`
-                                  : ""}
-                              </div>
-                            )}
-                          </div>
+                          {selected.length > 1
+                            ? `Split ${pot.label} (${selected.length} ways)`
+                            : `Award ${pot.label} (${pot.amountChips} Chips)`}
                         </button>
-                      );
-                    })}
+                      </>
+                    ) : (
+                      <div className="seat-sub">
+                        Waiting for Host to select the Showdown winner(s) for {pot.label}.
+                      </div>
+                    )}
                   </div>
-                  <button
-                    type="button"
-                    className="btn btn-primary"
-                    disabled={submitting || selectedWinners.length === 0}
-                    onClick={() => void handleResolveShowdown()}
-                  >
-                    {selectedWinners.length > 1
-                      ? `Split ${activeShowdownPot.label} (${selectedWinners.length} ways)`
-                      : `Award ${activeShowdownPot.label} (${activeShowdownPot.amountChips} Chips)`}
-                  </button>
-                </>
-              ) : (
-                <div className="seat-sub">
-                  Waiting for Host to select the Showdown winner(s) for {activeShowdownPot.label}.
-                </div>
-              )}
+                );
+              })}
             </div>
           )}
 

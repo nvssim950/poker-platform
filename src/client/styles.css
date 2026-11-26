@@ -350,3 +350,19 @@ body {
   color: var(--text);
   cursor: pointer;
 }
+
+.pot-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.pot-card {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
