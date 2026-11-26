@@ -1,20 +1,28 @@
 import {
   normalizeSessionCode,
   type ApproveBuyInRequestResponse,
+  type ApproveCashOutRequestResponse,
   type ClaimSeatInput,
   type ClaimSeatResponse,
   type CreateBuyInRequestInput,
   type CreateBuyInRequestResponse,
+  type CreateCashOutRequestInput,
+  type CreateCashOutRequestResponse,
   type CreateSessionInput,
   type CreateSessionResponse,
+  type DirectCashOutResponse,
   type GetSessionResponse,
   type RecordDirectLedgerInput,
   type RecordDirectLedgerResponse,
   type RejectBuyInRequestResponse,
+  type RejectCashOutRequestResponse,
   type ReleaseSeatResponse,
   type RelinkSeatResponse,
   type ResolveShowdownInput,
   type ResolveShowdownResponse,
+  type SetSitOutInput,
+  type SetSitOutResponse,
+  type SettleSessionResponse,
   type StartHandResponse,
   type SubmitHandActionInput,
   type SubmitHandActionResponse,
@@ -262,5 +270,100 @@ export const sessionApi = {
       body: JSON.stringify(input),
     });
     return parseJsonOrThrow<ResolveShowdownResponse>(res);
+  },
+
+  async setSitOut(
+    code: string,
+    seatNumber: number,
+    input: SetSitOutInput,
+    tokens: StoredSessionTokens,
+  ): Promise<SetSitOutResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/seats/${seatNumber}/sit-out`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(tokens),
+        },
+        body: JSON.stringify(input),
+      },
+    );
+    return parseJsonOrThrow<SetSitOutResponse>(res);
+  },
+
+  async createCashOutRequest(
+    code: string,
+    input: CreateCashOutRequestInput,
+    tokens: StoredSessionTokens,
+  ): Promise<CreateCashOutRequestResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/cash-out-requests`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...authHeaders(tokens),
+      },
+      body: JSON.stringify(input),
+    });
+    return parseJsonOrThrow<CreateCashOutRequestResponse>(res);
+  },
+
+  async approveCashOutRequest(
+    code: string,
+    requestId: string,
+    tokens: StoredSessionTokens,
+  ): Promise<ApproveCashOutRequestResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/cash-out-requests/${encodeURIComponent(requestId)}/approve`,
+      {
+        method: "POST",
+        headers: authHeaders(tokens),
+      },
+    );
+    return parseJsonOrThrow<ApproveCashOutRequestResponse>(res);
+  },
+
+  async rejectCashOutRequest(
+    code: string,
+    requestId: string,
+    tokens: StoredSessionTokens,
+  ): Promise<RejectCashOutRequestResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/cash-out-requests/${encodeURIComponent(requestId)}/reject`,
+      {
+        method: "POST",
+        headers: authHeaders(tokens),
+      },
+    );
+    return parseJsonOrThrow<RejectCashOutRequestResponse>(res);
+  },
+
+  async directCashOut(
+    code: string,
+    seatNumber: number,
+    tokens: StoredSessionTokens,
+  ): Promise<DirectCashOutResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/seats/${seatNumber}/cash-out`,
+      {
+        method: "POST",
+        headers: authHeaders(tokens),
+      },
+    );
+    return parseJsonOrThrow<DirectCashOutResponse>(res);
+  },
+
+  async settleSession(code: string, tokens: StoredSessionTokens): Promise<SettleSessionResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/settle`, {
+      method: "POST",
+      headers: authHeaders(tokens),
+    });
+    return parseJsonOrThrow<SettleSessionResponse>(res);
   },
 };
