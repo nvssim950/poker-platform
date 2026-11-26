@@ -1,10 +1,16 @@
 import {
   normalizeSessionCode,
+  type ApproveBuyInRequestResponse,
   type ClaimSeatInput,
   type ClaimSeatResponse,
+  type CreateBuyInRequestInput,
+  type CreateBuyInRequestResponse,
   type CreateSessionInput,
   type CreateSessionResponse,
   type GetSessionResponse,
+  type RecordDirectLedgerInput,
+  type RecordDirectLedgerResponse,
+  type RejectBuyInRequestResponse,
   type ReleaseSeatResponse,
   type RelinkSeatResponse,
 } from "../shared/session.ts";
@@ -138,5 +144,75 @@ export const sessionApi = {
       inflightRelinkRedemptions.delete(key);
     });
     return request;
+  },
+
+  async createBuyInRequest(
+    code: string,
+    input: CreateBuyInRequestInput,
+    tokens: StoredSessionTokens,
+  ): Promise<CreateBuyInRequestResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/buy-in-requests`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...authHeaders(tokens),
+      },
+      body: JSON.stringify(input),
+    });
+    return parseJsonOrThrow<CreateBuyInRequestResponse>(res);
+  },
+
+  async approveBuyInRequest(
+    code: string,
+    requestId: string,
+    tokens: StoredSessionTokens,
+  ): Promise<ApproveBuyInRequestResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/buy-in-requests/${encodeURIComponent(requestId)}/approve`,
+      {
+        method: "POST",
+        headers: authHeaders(tokens),
+      },
+    );
+    return parseJsonOrThrow<ApproveBuyInRequestResponse>(res);
+  },
+
+  async rejectBuyInRequest(
+    code: string,
+    requestId: string,
+    tokens: StoredSessionTokens,
+  ): Promise<RejectBuyInRequestResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/buy-in-requests/${encodeURIComponent(requestId)}/reject`,
+      {
+        method: "POST",
+        headers: authHeaders(tokens),
+      },
+    );
+    return parseJsonOrThrow<RejectBuyInRequestResponse>(res);
+  },
+
+  async recordDirectLedger(
+    code: string,
+    seatNumber: number,
+    input: RecordDirectLedgerInput,
+    tokens: StoredSessionTokens,
+  ): Promise<RecordDirectLedgerResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/seats/${seatNumber}/ledger`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...authHeaders(tokens),
+        },
+        body: JSON.stringify(input),
+      },
+    );
+    return parseJsonOrThrow<RecordDirectLedgerResponse>(res);
   },
 };

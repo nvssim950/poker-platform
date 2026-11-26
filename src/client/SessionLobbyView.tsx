@@ -1,11 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { ServerWsMessage } from "../shared/protocol.ts";
-import type { RelinkSeatResponse, SessionSnapshot, ViewerIdentity } from "../shared/session.ts";
+import {
+  formatCashMinor,
+  formatChipsAsCash,
+  getAvailableFundingForSeat,
+  type RelinkSeatResponse,
+  type SessionSnapshot,
+  type ViewerIdentity,
+} from "../shared/session.ts";
 import { loadSessionTokens, saveHostToken, saveSeatToken, sessionApi } from "./api.ts";
-
-function formatCashMinor(minorUnits: number, currencySymbol: string): string {
-  return `${currencySymbol}${(minorUnits / 100).toFixed(2)}`;
-}
+import { LedgerPanel } from "./LedgerPanel.tsx";
 
 function clearSeatTokenIfConfirmedInvalid(
   code: string,
@@ -43,6 +47,7 @@ export function SessionLobbyView({
     seatNumber: number;
     data: RelinkSeatResponse;
   } | null>(null);
+  const [selectedHostSeat, setSelectedHostSeat] = useState<number | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const subscribedSeatTokenRef = useRef<string | null>(null);
@@ -398,11 +403,30 @@ export function SessionLobbyView({
         </div>
       )}
 
+      <LedgerPanel
+        session={session}
+        viewer={viewer}
+        selectedHostSeat={selectedHostSeat}
+        onSelectHostSeat={setSelectedHostSeat}
+        onSessionUpdate={setSession}
+        onError={setError}
+      />
+
       <div className="card">
         <h3>Seats ({session.config.seatCount})</h3>
         <div className="seat-list">
           {session.seats.map((seat) => {
             const isMine = viewer.seatNumber === seat.seatNumber;
+            const seatFunding = seat.occupant
+              ? getAvailableFundingForSeat({
+                  config: session.config,
+                  chips: seat.occupant.chips,
+                  totalBuyInChips: seat.occupant.totalBuyInChips,
+                })
+              : null;
+            const releaseBlocked =
+              seat.occupant !== null &&
+              (seat.occupant.chips > 0 || seat.occupant.totalBuyInChips > 0);
             return (
               <div
                 key={seat.seatNumber}
@@ -425,7 +449,8 @@ export function SessionLobbyView({
                   </div>
                   {seat.occupant && (
                     <div className="seat-sub">
-                      {seat.occupant.chips} Chips ·{" "}
+                      {seat.occupant.chips} Chips · Buy-In: {seat.occupant.totalBuyInChips} Chips (
+                      {formatChipsAsCash(seat.occupant.totalBuyInChips, session.config)}) ·{" "}
                       {seat.occupant.isConnected ? "Connected" : "Offline"}
                     </div>
                   )}
@@ -443,6 +468,22 @@ export function SessionLobbyView({
                   )}
                   {seat.occupant && viewer.isHost && (
                     <>
+                      {seatFunding && (
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          disabled={seatFunding.disabledReason !== null}
+                          title={seatFunding.disabledReason ?? `Record ${seatFunding.label}`}
+                          onClick={() => {
+                            setSelectedHostSeat(seat.seatNumber);
+                            document
+                              .getElementById("host-ledger-entry")
+                              ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                          }}
+                        >
+                          +{seatFunding.label}
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="btn btn-secondary btn-sm"
@@ -453,6 +494,12 @@ export function SessionLobbyView({
                       <button
                         type="button"
                         className="btn btn-danger btn-sm"
+                        disabled={releaseBlocked}
+                        title={
+                          releaseBlocked
+                            ? "Cannot release a Seat with Chips or recorded Buy-Ins"
+                            : "Release Seat"
+                        }
                         onClick={() => void handleReleaseSeat(seat.seatNumber)}
                       >
                         Release

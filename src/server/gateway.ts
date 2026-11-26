@@ -204,13 +204,12 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
     }
   }
 
-  function requireHostForSeat(
+  function requireHostForSession(
     req: IncomingMessage,
     res: ServerResponse,
     rawCode: string,
-    rawSeat: string | undefined,
     actionDescription: string,
-  ): { code: string; seatNumber: number } | null {
+  ): { code: string; stored: StoredSession } | null {
     const code = normalizeSessionCode(rawCode);
     const stored = storage.getSession(code);
     if (!stored) {
@@ -222,12 +221,55 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
       sendJson(res, 403, { error: `Host authority is required to ${actionDescription}.` });
       return null;
     }
-    const seatNumber = Number(rawSeat);
-    if (!Number.isInteger(seatNumber) || seatNumber < 1 || seatNumber > stored.config.seatCount) {
-      sendJson(res, 400, { error: `Seat number must be between 1 and ${stored.config.seatCount}.` });
+    return { code, stored };
+  }
+
+  function requireHostForSeat(
+    req: IncomingMessage,
+    res: ServerResponse,
+    rawCode: string,
+    rawSeat: string | undefined,
+    actionDescription: string,
+  ): { code: string; seatNumber: number } | null {
+    const sessionCtx = requireHostForSession(req, res, rawCode, actionDescription);
+    if (!sessionCtx) {
       return null;
     }
-    return { code, seatNumber };
+    const seatNumber = Number(rawSeat);
+    if (
+      !Number.isInteger(seatNumber) ||
+      seatNumber < 1 ||
+      seatNumber > sessionCtx.stored.config.seatCount
+    ) {
+      sendJson(res, 400, {
+        error: `Seat number must be between 1 and ${sessionCtx.stored.config.seatCount}.`,
+      });
+      return null;
+    }
+    return { code: sessionCtx.code, seatNumber };
+  }
+
+  async function readJsonBodyOr400(req: IncomingMessage, res: ServerResponse): Promise<unknown | undefined> {
+    try {
+      return await readJsonBody(req);
+    } catch {
+      sendJson(res, 400, { error: "Invalid JSON request body." });
+      return undefined;
+    }
+  }
+
+  function sendStorageFailure(
+    res: ServerResponse,
+    reason: "NOT_FOUND" | "REQUEST_NOT_FOUND" | "VALIDATION" | "CONFLICT" | "EMPTY" | "HAS_LEDGER_ACTIVITY",
+    error: string,
+  ): void {
+    const status =
+      reason === "NOT_FOUND" || reason === "REQUEST_NOT_FOUND"
+        ? 404
+        : reason === "VALIDATION"
+          ? 400
+          : 409;
+    sendJson(res, status, { error });
   }
 
   const server = createServer(async (req, res) => {
@@ -355,11 +397,7 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
 
         const result = storage.releaseSeat(ctx.code, ctx.seatNumber);
         if (!result.ok) {
-          sendJson(
-            res,
-            result.reason === "NOT_FOUND" ? 404 : 409,
-            { error: result.reason === "NOT_FOUND" ? "Session not found." : "Seat is already open." },
-          );
+          sendStorageFailure(res, result.reason, result.error);
           return;
         }
 
@@ -380,11 +418,7 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         const relinkCode = generateSecretToken();
         const result = storage.issueRelinkCode(ctx.code, ctx.seatNumber, relinkCode);
         if (!result.ok) {
-          sendJson(
-            res,
-            result.reason === "NOT_FOUND" ? 404 : 409,
-            { error: result.reason === "NOT_FOUND" ? "Session not found." : "Seat is open and has no Player to re-link." },
-          );
+          sendStorageFailure(res, result.reason, result.error);
           return;
         }
 
@@ -439,6 +473,145 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
           seatToken: newSeatToken,
           playerId: result.playerId,
           seatNumber: result.seatNumber,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const buyInReqMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/buy-in-requests$/);
+      if (method === "POST" && buyInReqMatch) {
+        const code = normalizeSessionCode(buyInReqMatch[1] ?? "");
+        const stored = storage.getSession(code);
+        if (!stored) {
+          sendJson(res, 404, { error: "Session not found." });
+          return;
+        }
+
+        const hostToken = readHeaderToken(req, "x-host-token");
+        const seatToken = readHeaderToken(req, "x-seat-token");
+        const viewer = resolveSessionViewer(stored, hostToken, seatToken);
+        if (viewer.seatNumber === null || viewer.playerId === null) {
+          sendJson(res, 403, { error: "A seated Player token is required to request Chips." });
+          return;
+        }
+
+        const body = await readJsonBodyOr400(req, res);
+        if (body === undefined) {
+          return;
+        }
+        if (typeof body === "object" && body !== null && "seatNumber" in body) {
+          const requestedSeat = (body as Record<string, unknown>).seatNumber;
+          if (requestedSeat !== undefined && requestedSeat !== viewer.seatNumber) {
+            sendJson(res, 403, { error: "Players can only request Chips for their own Seat." });
+            return;
+          }
+        }
+
+        const payload = (typeof body === "object" && body !== null ? body : {}) as Record<
+          string,
+          unknown
+        >;
+        const result = storage.createBuyInRequest(code, {
+          id: randomUUID(),
+          seatNumber: viewer.seatNumber,
+          playerId: viewer.playerId,
+          kind: payload.kind,
+          amountChips: payload.amountChips,
+        });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(code);
+        sendJson(res, 201, {
+          request: result.request,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const resolveReqMatch = pathname.match(
+        /^\/api\/sessions\/([A-Za-z0-9]+)\/buy-in-requests\/([A-Za-z0-9-]+)\/(approve|reject)$/,
+      );
+      if (method === "POST" && resolveReqMatch) {
+        const action = resolveReqMatch[3] as "approve" | "reject";
+        const ctx = requireHostForSession(
+          req,
+          res,
+          resolveReqMatch[1] ?? "",
+          `${action} a Buy-In request`,
+        );
+        if (!ctx) {
+          return;
+        }
+
+        const requestId = resolveReqMatch[2] ?? "";
+        if (action === "approve") {
+          const result = storage.approveBuyInRequest(ctx.code, requestId, randomUUID());
+          if (!result.ok) {
+            sendStorageFailure(res, result.reason, result.error);
+            return;
+          }
+          broadcastSession(ctx.code);
+          sendJson(res, 200, {
+            request: result.request,
+            ledgerEntry: result.ledgerEntry,
+            session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+          });
+          return;
+        }
+
+        const result = storage.rejectBuyInRequest(ctx.code, requestId);
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+        broadcastSession(ctx.code);
+        sendJson(res, 200, {
+          request: result.request,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const directLedgerMatch = pathname.match(
+        /^\/api\/sessions\/([A-Za-z0-9]+)\/seats\/(\d+)\/ledger$/,
+      );
+      if (method === "POST" && directLedgerMatch) {
+        const ctx = requireHostForSeat(
+          req,
+          res,
+          directLedgerMatch[1] ?? "",
+          directLedgerMatch[2],
+          "record Chips on the ledger",
+        );
+        if (!ctx) {
+          return;
+        }
+
+        const body = await readJsonBodyOr400(req, res);
+        if (body === undefined) {
+          return;
+        }
+        const payload = (typeof body === "object" && body !== null ? body : {}) as Record<
+          string,
+          unknown
+        >;
+        const result = storage.recordDirectLedgerEntry(ctx.code, {
+          ledgerEntryId: randomUUID(),
+          seatNumber: ctx.seatNumber,
+          kind: payload.kind,
+          amountChips: payload.amountChips,
+        });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
+        sendJson(res, 201, {
+          ledgerEntry: result.ledgerEntry,
           session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
         });
         return;

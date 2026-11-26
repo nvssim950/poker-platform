@@ -22,10 +22,38 @@ export interface CreateSessionInput {
   maxBuyInChips?: number | null | undefined;
 }
 
+export type FundingKind = "BUY_IN" | "REBUY" | "TOP_UP";
+export type BuyInRequestStatus = "PENDING" | "APPROVED" | "REJECTED";
+export type LedgerEntrySource = "REQUEST_APPROVAL" | "HOST_DIRECT";
+
+export interface BuyInRequestView {
+  id: string;
+  seatNumber: number;
+  playerId: string;
+  displayName: string;
+  kind: FundingKind;
+  amountChips: number;
+  status: BuyInRequestStatus;
+  createdAt: string;
+}
+
+export interface LedgerEntryView {
+  id: string;
+  seatNumber: number;
+  playerId: string;
+  displayName: string;
+  kind: FundingKind;
+  amountChips: number;
+  source: LedgerEntrySource;
+  requestId: string | null;
+  createdAt: string;
+}
+
 export interface SeatOccupant {
   playerId: string;
   displayName: string;
   chips: number;
+  totalBuyInChips: number;
   isConnected: boolean;
   hasPendingRelink: boolean;
 }
@@ -39,6 +67,8 @@ export interface SessionSnapshot {
   code: string;
   config: SessionConfig;
   seats: SeatView[];
+  pendingRequests: BuyInRequestView[];
+  ledgerEntries: LedgerEntryView[];
 }
 
 export interface ViewerIdentity {
@@ -88,6 +118,38 @@ export interface RelinkSeatResponse {
 }
 
 export interface ReleaseSeatResponse {
+  session: SessionSnapshot;
+}
+
+export interface CreateBuyInRequestInput {
+  kind: FundingKind;
+  amountChips: number;
+  seatNumber?: number | undefined;
+}
+
+export interface CreateBuyInRequestResponse {
+  request: BuyInRequestView;
+  session: SessionSnapshot;
+}
+
+export interface ApproveBuyInRequestResponse {
+  request: BuyInRequestView;
+  ledgerEntry: LedgerEntryView;
+  session: SessionSnapshot;
+}
+
+export interface RejectBuyInRequestResponse {
+  request: BuyInRequestView;
+  session: SessionSnapshot;
+}
+
+export interface RecordDirectLedgerInput {
+  kind: FundingKind;
+  amountChips: number;
+}
+
+export interface RecordDirectLedgerResponse {
+  ledgerEntry: LedgerEntryView;
   session: SessionSnapshot;
 }
 
@@ -197,5 +259,230 @@ export function validateSessionConfig(input: unknown): ValidationResult<SessionC
       minBuyInChips: minRaw,
       maxBuyInChips: maxRaw,
     },
+  };
+}
+
+/**
+ * Converts a Chip quantity into integer Cash minor units using the Session exchange rate.
+ */
+export function chipsToCashMinor(
+  chips: number,
+  config: Pick<SessionConfig, "exchangeRateChips" | "exchangeRateCashMinor">,
+): number {
+  const scaled = (Math.abs(chips) * config.exchangeRateCashMinor) / config.exchangeRateChips;
+  return Math.sign(chips) * Math.round(scaled);
+}
+
+/**
+ * Formats integer Cash minor units (e.g. cents) with the Session currency symbol.
+ */
+export function formatCashMinor(minorUnits: number, currencySymbol: string): string {
+  const sign = minorUnits < 0 ? "-" : "";
+  return `${sign}${currencySymbol}${(Math.abs(minorUnits) / 100).toFixed(2)}`;
+}
+
+/**
+ * Formats a Chip quantity as its Cash obligation equivalent under the Session exchange rate.
+ */
+export function formatChipsAsCash(
+  chips: number,
+  config: Pick<SessionConfig, "exchangeRateChips" | "exchangeRateCashMinor" | "currencySymbol">,
+): string {
+  return formatCashMinor(chipsToCashMinor(chips, config), config.currencySymbol);
+}
+
+export interface FundingEligibilityContext {
+  config: Pick<SessionConfig, "smallestChipStep" | "minBuyInChips" | "maxBuyInChips">;
+  chips: number;
+  totalBuyInChips: number;
+  handInProgress?: boolean;
+}
+
+export type FundingValidationResult =
+  | { ok: true; value: { kind: FundingKind; amountChips: number } }
+  | { ok: false; reason: "VALIDATION" | "CONFLICT"; error: string };
+
+export interface AvailableFundingOption {
+  kind: FundingKind;
+  label: string;
+  minAmountChips: number;
+  maxAmountChips: number | null;
+  disabledReason: string | null;
+}
+
+const FUNDING_KIND_LABELS: Record<FundingKind, string> = {
+  BUY_IN: "Buy-In",
+  REBUY: "Rebuy",
+  TOP_UP: "Top-Up",
+};
+
+function isFundingKind(value: unknown): value is FundingKind {
+  return value === "BUY_IN" || value === "REBUY" || value === "TOP_UP";
+}
+
+function validateBounds(
+  kindLabel: string,
+  amountChips: number,
+  minBuyInChips: number | null,
+  maxBuyInChips: number | null,
+): FundingValidationResult | null {
+  if (minBuyInChips !== null && amountChips < minBuyInChips) {
+    return {
+      ok: false,
+      reason: "VALIDATION",
+      error: `${kindLabel} must be at least ${minBuyInChips} Chips.`,
+    };
+  }
+  if (maxBuyInChips !== null && amountChips > maxBuyInChips) {
+    return {
+      ok: false,
+      reason: "VALIDATION",
+      error: `${kindLabel} cannot exceed ${maxBuyInChips} Chips.`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Validates a Buy-In, Rebuy, or Top-Up request against Session rules and current Seat state.
+ */
+export function validateFundingOperation(
+  input: unknown,
+  ctx: FundingEligibilityContext,
+): FundingValidationResult {
+  if (typeof input !== "object" || input === null) {
+    return { ok: false, reason: "VALIDATION", error: "Funding payload must be an object." };
+  }
+  const raw = input as Record<string, unknown>;
+  if (!isFundingKind(raw.kind)) {
+    return {
+      ok: false,
+      reason: "VALIDATION",
+      error: "Funding kind must be BUY_IN, REBUY, or TOP_UP.",
+    };
+  }
+  if (!isPositiveInt(raw.amountChips)) {
+    return {
+      ok: false,
+      reason: "VALIDATION",
+      error: "Amount must be a positive integer in Chips.",
+    };
+  }
+  const amountChips = raw.amountChips;
+  const { smallestChipStep, minBuyInChips, maxBuyInChips } = ctx.config;
+  if (!isStepMultiple(amountChips, smallestChipStep)) {
+    return {
+      ok: false,
+      reason: "VALIDATION",
+      error: `Amount must be a multiple of the smallest Chip step (${smallestChipStep}).`,
+    };
+  }
+
+  const handInProgress = ctx.handInProgress ?? false;
+
+  if (raw.kind === "BUY_IN") {
+    if (ctx.totalBuyInChips > 0 || ctx.chips > 0) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "Seat already has an initial Buy-In; use Rebuy or Top-Up.",
+      };
+    }
+    const boundsError = validateBounds("Buy-In", amountChips, minBuyInChips, maxBuyInChips);
+    if (boundsError) {
+      return boundsError;
+    }
+    return { ok: true, value: { kind: "BUY_IN", amountChips } };
+  }
+
+  if (raw.kind === "REBUY") {
+    if (handInProgress) {
+      return { ok: false, reason: "CONFLICT", error: "Rebuy is only allowed between Hands." };
+    }
+    if (ctx.chips !== 0) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "Rebuy is only allowed when stack is zero Chips.",
+      };
+    }
+    if (ctx.totalBuyInChips === 0) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "Initial Buy-In is required before taking a Rebuy.",
+      };
+    }
+    const boundsError = validateBounds("Rebuy", amountChips, minBuyInChips, maxBuyInChips);
+    if (boundsError) {
+      return boundsError;
+    }
+    return { ok: true, value: { kind: "REBUY", amountChips } };
+  }
+
+  if (handInProgress) {
+    return { ok: false, reason: "CONFLICT", error: "Top-Up is only allowed between Hands." };
+  }
+  if (ctx.chips <= 0) {
+    return {
+      ok: false,
+      reason: "CONFLICT",
+      error: "Top-Up requires a non-zero Chip stack.",
+    };
+  }
+  if (maxBuyInChips !== null && ctx.chips + amountChips > maxBuyInChips) {
+    return {
+      ok: false,
+      reason: "CONFLICT",
+      error: `Top-Up cannot raise stack above the Session max Buy-In (${maxBuyInChips} Chips).`,
+    };
+  }
+  return { ok: true, value: { kind: "TOP_UP", amountChips } };
+}
+
+/**
+ * Determines the currently eligible funding action and Chip bounds for an occupied Seat.
+ */
+export function getAvailableFundingForSeat(
+  ctx: FundingEligibilityContext,
+): AvailableFundingOption {
+  const { smallestChipStep, minBuyInChips, maxBuyInChips } = ctx.config;
+  const handInProgress = ctx.handInProgress ?? false;
+
+  if (ctx.chips === 0 && ctx.totalBuyInChips === 0) {
+    return {
+      kind: "BUY_IN",
+      label: FUNDING_KIND_LABELS.BUY_IN,
+      minAmountChips: minBuyInChips ?? smallestChipStep,
+      maxAmountChips: maxBuyInChips,
+      disabledReason: null,
+    };
+  }
+
+  if (ctx.chips === 0) {
+    return {
+      kind: "REBUY",
+      label: FUNDING_KIND_LABELS.REBUY,
+      minAmountChips: minBuyInChips ?? smallestChipStep,
+      maxAmountChips: maxBuyInChips,
+      disabledReason: handInProgress ? "Rebuy is only allowed between Hands." : null,
+    };
+  }
+
+  const remainingMax =
+    maxBuyInChips !== null ? Math.max(0, maxBuyInChips - ctx.chips) : null;
+  let disabledReason: string | null = null;
+  if (handInProgress) {
+    disabledReason = "Top-Up is only allowed between Hands.";
+  } else if (remainingMax !== null && remainingMax < smallestChipStep) {
+    disabledReason = `Stack is already at the Session max Buy-In (${maxBuyInChips} Chips).`;
+  }
+
+  return {
+    kind: "TOP_UP",
+    label: FUNDING_KIND_LABELS.TOP_UP,
+    minAmountChips: smallestChipStep,
+    maxAmountChips: remainingMax,
+    disabledReason,
   };
 }
