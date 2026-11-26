@@ -9,6 +9,7 @@ import {
   type ViewerIdentity,
 } from "../shared/session.ts";
 import { loadSessionTokens, saveHostToken, saveSeatToken, sessionApi } from "./api.ts";
+import { HandHistoryPanel } from "./HandHistoryPanel.tsx";
 import { HandTablePanel } from "./HandTablePanel.tsx";
 import { LedgerPanel } from "./LedgerPanel.tsx";
 import { SettlementPanel } from "./SettlementPanel.tsx";
@@ -464,6 +465,8 @@ export function SessionLobbyView({
           onError={setError}
         />
       )}
+
+      <HandHistoryPanel session={session} />
 
       <LedgerPanel
         session={session}

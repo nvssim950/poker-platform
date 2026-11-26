@@ -18,11 +18,13 @@ import {
   type CashOutRequestView,
   type CashOutSource,
   type FundingKind,
+  type GetSessionHandsResponse,
   type LedgerEntrySource,
   type LedgerEntryView,
   type SeatView,
   type SessionConfig,
   type SessionSnapshot,
+  type SessionStats,
   type SessionStatus,
   type ViewerIdentity,
 } from "../shared/session.ts";
@@ -108,6 +110,9 @@ export interface StoredSession {
   settlement: SettlementSummary | null;
   ledgerEntries: LedgerEntryView[];
   hand: HandState | null;
+  canUndo: boolean;
+  handHistory: HandState[];
+  sessionStats: SessionStats;
 }
 
 export type ClaimSeatResult =
@@ -250,6 +255,8 @@ export interface SessionStorage {
       potId?: string | undefined;
     },
   ): HandMutationResult;
+  undoHandStep(code: string): HandMutationResult;
+  getSessionHands(code: string): GetSessionHandsResponse | null;
   close(): void;
 }
 
@@ -401,10 +408,19 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       state_json TEXT NOT NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
+      ledger_seq INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (session_code, hand_number)
     );
     CREATE INDEX IF NOT EXISTS idx_hands_session_latest
       ON hands (session_code, hand_number DESC);
+    CREATE TABLE IF NOT EXISTS hand_checkpoints (
+      session_code TEXT NOT NULL REFERENCES sessions(code) ON DELETE CASCADE,
+      hand_number INTEGER NOT NULL,
+      step_index INTEGER NOT NULL,
+      state_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (session_code, hand_number, step_index)
+    );
   `);
 
   const sessionColumns = db.prepare("PRAGMA table_info(sessions)").all() as Array<{ name: string }>;
@@ -413,6 +429,14 @@ export function createSessionStorage(dbPath: string): SessionStorage {
   }
   if (!sessionColumns.some((col) => col.name === "settlement_json")) {
     db.exec("ALTER TABLE sessions ADD COLUMN settlement_json TEXT;");
+  }
+  if (!sessionColumns.some((col) => col.name === "ledger_seq")) {
+    db.exec("ALTER TABLE sessions ADD COLUMN ledger_seq INTEGER NOT NULL DEFAULT 0;");
+  }
+
+  const handColumns = db.prepare("PRAGMA table_info(hands)").all() as Array<{ name: string }>;
+  if (!handColumns.some((col) => col.name === "ledger_seq")) {
+    db.exec("ALTER TABLE hands ADD COLUMN ledger_seq INTEGER NOT NULL DEFAULT 0;");
   }
 
   const seatColumns = db.prepare("PRAGMA table_info(seats)").all() as Array<{ name: string }>;
@@ -424,13 +448,16 @@ export function createSessionStorage(dbPath: string): SessionStorage {
   }
 
   const insertSessionStmt = db.prepare(
-    "INSERT INTO sessions (code, host_token, config_json, status, settlement_json, created_at) VALUES (?, ?, ?, 'ACTIVE', NULL, ?)",
+    "INSERT INTO sessions (code, host_token, config_json, status, settlement_json, ledger_seq, created_at) VALUES (?, ?, ?, 'ACTIVE', NULL, 0, ?)",
   );
   const insertSeatStmt = db.prepare(
     "INSERT INTO seats (session_code, seat_number, player_id, display_name, seat_token, relink_code, chips, total_buy_in_chips, is_sitting_out) VALUES (?, ?, NULL, NULL, NULL, NULL, 0, 0, 0)",
   );
   const selectSessionStmt = db.prepare(
-    "SELECT code, host_token, config_json, status, settlement_json FROM sessions WHERE code = ?",
+    "SELECT code, host_token, config_json, status, settlement_json, ledger_seq FROM sessions WHERE code = ?",
+  );
+  const incrementSessionLedgerSeqStmt = db.prepare(
+    "UPDATE sessions SET ledger_seq = ledger_seq + 1 WHERE code = ?",
   );
   const selectSeatsStmt = db.prepare(
     "SELECT session_code, seat_number, player_id, display_name, seat_token, relink_code, chips, total_buy_in_chips, is_sitting_out FROM seats WHERE session_code = ? ORDER BY seat_number ASC",
@@ -513,21 +540,66 @@ export function createSessionStorage(dbPath: string): SessionStorage {
   const insertLedgerEntryStmt = db.prepare(
     "INSERT INTO ledger_entries (id, session_code, seat_number, player_id, display_name, kind, amount_chips, source, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   );
-  const selectLatestHandStmt = db.prepare(
-    "SELECT state_json FROM hands WHERE session_code = ? ORDER BY hand_number DESC LIMIT 1",
+  const selectLatestHandRowStmt = db.prepare(
+    "SELECT hand_number, status, state_json, updated_at, ledger_seq FROM hands WHERE session_code = ? ORDER BY hand_number DESC LIMIT 1",
+  );
+  const selectCompletedHandsStmt = db.prepare(
+    "SELECT state_json FROM hands WHERE session_code = ? AND status = 'COMPLETE' ORDER BY hand_number DESC",
   );
   const selectActiveHandExistsStmt = db.prepare(
     "SELECT 1 AS active FROM hands WHERE session_code = ? AND status != 'COMPLETE' LIMIT 1",
   );
   const insertHandStmt = db.prepare(
-    "INSERT INTO hands (session_code, hand_number, status, button_seat_number, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    "INSERT INTO hands (session_code, hand_number, status, button_seat_number, state_json, created_at, updated_at, ledger_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   );
   const updateHandStmt = db.prepare(
-    "UPDATE hands SET status = ?, button_seat_number = ?, state_json = ?, updated_at = ? WHERE session_code = ? AND hand_number = ?",
+    "UPDATE hands SET status = ?, button_seat_number = ?, state_json = ?, updated_at = ?, ledger_seq = ? WHERE session_code = ? AND hand_number = ?",
+  );
+  const selectMaxCheckpointStepStmt = db.prepare(
+    "SELECT MAX(step_index) AS max_step FROM hand_checkpoints WHERE session_code = ? AND hand_number = ?",
+  );
+  const selectCheckpointStmt = db.prepare(
+    "SELECT state_json FROM hand_checkpoints WHERE session_code = ? AND hand_number = ? AND step_index = ?",
+  );
+  const insertCheckpointStmt = db.prepare(
+    "INSERT INTO hand_checkpoints (session_code, hand_number, step_index, state_json, created_at) VALUES (?, ?, ?, ?, ?)",
+  );
+  const deleteCheckpointStmt = db.prepare(
+    "DELETE FROM hand_checkpoints WHERE session_code = ? AND hand_number = ? AND step_index = ?",
+  );
+  const prunePriorCheckpointsStmt = db.prepare(
+    "DELETE FROM hand_checkpoints WHERE session_code = ? AND hand_number < ?",
+  );
+  const selectLedgerAfterStmt = db.prepare(
+    "SELECT 1 AS hit FROM ledger_entries WHERE session_code = ? AND created_at > ? LIMIT 1",
+  );
+  const selectCashOutAfterStmt = db.prepare(
+    "SELECT 1 AS hit FROM cash_outs WHERE session_code = ? AND cashed_out_at > ? LIMIT 1",
   );
   const setSeatChipsStmt = db.prepare(
     "UPDATE seats SET chips = ? WHERE session_code = ? AND seat_number = ? AND player_id = ?",
   );
+
+  interface StoredHandRow {
+    hand_number: number;
+    status: HandState["status"];
+    state_json: string;
+    updated_at: string;
+    ledger_seq: number;
+  }
+
+  type UndoCheckResult =
+    | {
+        ok: true;
+        maxStep: number;
+        restoredHand: HandState;
+        sessionLedgerSeq: number;
+      }
+    | {
+        ok: false;
+        reason: "NOT_FOUND" | "CONFLICT";
+        error: string;
+      };
 
   function mapSeatRowsToViews(rows: readonly StoredSeatRow[]): SeatView[] {
     return rows.map((seat) => ({
@@ -547,9 +619,122 @@ export function createSessionStorage(dbPath: string): SessionStorage {
     }));
   }
 
+  function getLatestHandRow(code: string): StoredHandRow | undefined {
+    return selectLatestHandRowStmt.get(code) as StoredHandRow | undefined;
+  }
+
   function getLatestHand(code: string): HandState | null {
-    const row = selectLatestHandStmt.get(code) as { state_json: string } | undefined;
+    const row = getLatestHandRow(code);
     return row ? normalizeHandState(JSON.parse(row.state_json) as HandState) : null;
+  }
+
+  function getHandHistoryAndStats(code: string): {
+    handHistory: HandState[];
+    sessionStats: SessionStats;
+  } {
+    const rows = selectCompletedHandsStmt.all(code) as Array<{ state_json: string }>;
+    const handHistory = rows.map((r) => normalizeHandState(JSON.parse(r.state_json) as HandState));
+    let biggestPotChips = 0;
+    let biggestHandNumber: number | null = null;
+    for (const hand of handHistory) {
+      const potChips =
+        hand.result?.totalPotChips ?? hand.pots.reduce((sum, p) => sum + p.amountChips, 0);
+      if (potChips > biggestPotChips || (biggestHandNumber === null && potChips === 0)) {
+        biggestPotChips = potChips;
+        biggestHandNumber = hand.handNumber;
+      }
+    }
+    return {
+      handHistory,
+      sessionStats: {
+        handsPlayed: handHistory.length,
+        biggestPotChips,
+        biggestHandNumber,
+      },
+    };
+  }
+
+  function validateUndoState(
+    code: string,
+    sessionRow: { status: SessionStatus; ledger_seq: number } | undefined,
+    latestHandRow: StoredHandRow | undefined,
+    seatRows: readonly StoredSeatRow[],
+  ): UndoCheckResult {
+    if (!sessionRow) {
+      return { ok: false, reason: "NOT_FOUND", error: "Session not found." };
+    }
+    if (sessionRow.status === "SETTLED") {
+      return { ok: false, reason: "CONFLICT", error: "Session is already settled." };
+    }
+    if (!latestHandRow) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "At start of current Hand; nothing left to undo.",
+      };
+    }
+
+    const maxRow = selectMaxCheckpointStepStmt.get(code, latestHandRow.hand_number) as
+      | { max_step: number | null }
+      | undefined;
+    const maxStep = maxRow?.max_step ?? null;
+    if (maxStep === null || maxStep <= 0) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "At start of current Hand; nothing left to undo.",
+      };
+    }
+
+    const prevCheckpoint = selectCheckpointStmt.get(
+      code,
+      latestHandRow.hand_number,
+      maxStep - 1,
+    ) as { state_json: string } | undefined;
+    if (!prevCheckpoint) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "At start of current Hand; nothing left to undo.",
+      };
+    }
+
+    const restoredHand = normalizeHandState(JSON.parse(prevCheckpoint.state_json) as HandState);
+
+    if (latestHandRow.status === "COMPLETE") {
+      const hasSubsequentLedger =
+        sessionRow.ledger_seq > latestHandRow.ledger_seq ||
+        selectLedgerAfterStmt.get(code, latestHandRow.updated_at) !== undefined ||
+        selectCashOutAfterStmt.get(code, latestHandRow.updated_at) !== undefined;
+      if (hasSubsequentLedger) {
+        return {
+          ok: false,
+          reason: "CONFLICT",
+          error:
+            "Cannot undo completed Hand after subsequent Buy-In, Rebuy, Top-Up, or Cash-Out activity.",
+        };
+      }
+    }
+
+    const seatByNumber = new Map(seatRows.map((s) => [s.seat_number, s]));
+    for (const handSeat of restoredHand.seats) {
+      const seatRow = seatByNumber.get(handSeat.seatNumber);
+      if (!seatRow || seatRow.player_id !== handSeat.playerId) {
+        return {
+          ok: false,
+          reason: "CONFLICT",
+          error:
+            "Cannot undo Hand because a participating Seat is no longer occupied by the same Player.",
+        };
+      }
+    }
+
+    return {
+      ok: true,
+      maxStep,
+      restoredHand,
+      sessionLedgerSeq: sessionRow.ledger_seq,
+    };
   }
 
   function getSession(rawCode: string): StoredSession | null {
@@ -561,6 +746,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
           config_json: string;
           status: SessionStatus;
           settlement_json: string | null;
+          ledger_seq: number;
         }
       | undefined;
     if (!row) {
@@ -573,7 +759,12 @@ export function createSessionStorage(dbPath: string): SessionStorage {
     ) as unknown as StoredCashOutRequestRow[];
     const cashOutRows = selectCashOutsStmt.all(code) as unknown as StoredCashOutRow[];
     const ledgerRows = selectLedgerEntriesStmt.all(code) as unknown as StoredLedgerEntryRow[];
-    const hand = getLatestHand(code);
+    const latestHandRow = getLatestHandRow(code);
+    const hand = latestHandRow
+      ? normalizeHandState(JSON.parse(latestHandRow.state_json) as HandState)
+      : null;
+    const { handHistory, sessionStats } = getHandHistoryAndStats(code);
+    const canUndo = validateUndoState(code, row, latestHandRow, seats).ok;
     return {
       code: row.code,
       hostToken: row.host_token,
@@ -588,6 +779,9 @@ export function createSessionStorage(dbPath: string): SessionStorage {
         : null,
       ledgerEntries: ledgerRows.map(mapLedgerEntryRow),
       hand,
+      canUndo,
+      handHistory,
+      sessionStats,
     };
   }
 
@@ -605,14 +799,15 @@ export function createSessionStorage(dbPath: string): SessionStorage {
 
   function getSessionMeta(
     code: string,
-  ): { config: SessionConfig; status: SessionStatus } | null {
+  ): { config: SessionConfig; status: SessionStatus; ledgerSeq: number } | null {
     const row = selectSessionStmt.get(code) as
-      | { config_json: string; status: SessionStatus }
+      | { config_json: string; status: SessionStatus; ledger_seq: number }
       | undefined;
     return row
       ? {
           config: normalizeSessionConfig(JSON.parse(row.config_json) as SessionConfig),
           status: row.status,
+          ledgerSeq: row.ledger_seq,
         }
       : null;
   }
@@ -620,7 +815,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
   function requireActiveSessionMeta(
     code: string,
   ):
-    | { ok: true; config: SessionConfig }
+    | { ok: true; config: SessionConfig; ledgerSeq: number }
     | { ok: false; reason: "NOT_FOUND" | "CONFLICT"; error: string } {
     const meta = getSessionMeta(code);
     if (!meta) {
@@ -629,7 +824,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
     if (meta.status === "SETTLED") {
       return { ok: false, reason: "CONFLICT", error: "Session is already settled." };
     }
-    return { ok: true, config: meta.config };
+    return { ok: true, config: meta.config, ledgerSeq: meta.ledgerSeq };
   }
 
   function hasActiveHand(code: string): boolean {
@@ -655,6 +850,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
     expectedStatus: HandState["status"],
     missingStatusError: string,
     transition: (hand: HandState, config: SessionConfig) => ReturnType<typeof applyHandActionEngine>,
+    isNoOp?: (prev: HandState, next: HandState) => boolean,
   ): HandMutationResult {
     const code = normalizeSessionCode(rawCode);
     return runInTransaction<HandMutationResult>(() => {
@@ -672,12 +868,42 @@ export function createSessionStorage(dbPath: string): SessionStorage {
         return next;
       }
 
+      if (isNoOp?.(latestHand, next.value)) {
+        const unchangedSession = getSession(code);
+        if (!unchangedSession) {
+          throw new Error(`Session ${code} disappeared during Hand mutation`);
+        }
+        return { ok: true, hand: latestHand, session: unchangedSession };
+      }
+
+      const now = new Date().toISOString();
+      const nextJson = JSON.stringify(next.value);
       syncSeatsFromHand(code, next.value);
+
+      const maxRow = selectMaxCheckpointStepStmt.get(code, next.value.handNumber) as
+        | { max_step: number | null }
+        | undefined;
+      let nextStep: number;
+      if (maxRow?.max_step === null || maxRow?.max_step === undefined) {
+        insertCheckpointStmt.run(
+          code,
+          latestHand.handNumber,
+          0,
+          JSON.stringify(latestHand),
+          now,
+        );
+        nextStep = 1;
+      } else {
+        nextStep = maxRow.max_step + 1;
+      }
+
+      insertCheckpointStmt.run(code, next.value.handNumber, nextStep, nextJson, now);
       updateHandStmt.run(
         next.value.status,
         next.value.buttonSeatNumber,
-        JSON.stringify(next.value),
-        new Date().toISOString(),
+        nextJson,
+        now,
+        activeMeta.ledgerSeq,
         code,
         next.value.handNumber,
       );
@@ -758,6 +984,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       params.requestId,
       params.now,
     );
+    incrementSessionLedgerSeqStmt.run(params.code);
 
     rejectPendingSeatBuyInRequestsStmt.run(params.now, params.code, params.seatNumber);
     rejectPendingSeatCashOutRequestsStmt.run(params.now, params.code, params.seatNumber);
@@ -847,6 +1074,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       params.requestId,
       params.now,
     );
+    incrementSessionLedgerSeqStmt.run(params.code);
 
     return {
       ok: true,
@@ -1546,16 +1774,20 @@ export function createSessionStorage(dbPath: string): SessionStorage {
         }
 
         const now = new Date().toISOString();
+        const serialized = JSON.stringify(started.value);
         syncSeatsFromHand(code, started.value);
         insertHandStmt.run(
           code,
           started.value.handNumber,
           started.value.status,
           started.value.buttonSeatNumber,
-          JSON.stringify(started.value),
+          serialized,
           now,
           now,
+          activeMeta.ledgerSeq,
         );
+        prunePriorCheckpointsStmt.run(code, started.value.handNumber);
+        insertCheckpointStmt.run(code, started.value.handNumber, 0, serialized, now);
 
         const updated = getSession(code);
         if (!updated) {
@@ -1580,6 +1812,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
         "SHOWDOWN",
         "No Hand is currently awaiting Showdown.",
         (hand, config) => setRunItTwiceEngine(hand, config, params.enabled),
+        (prev, next) => prev.runItTwice === next.runItTwice,
       );
     },
 
@@ -1590,6 +1823,53 @@ export function createSessionStorage(dbPath: string): SessionStorage {
         "No Hand is currently awaiting Showdown.",
         (hand, config) => resolveShowdownEngine(hand, config, params),
       );
+    },
+
+    undoHandStep(rawCode): HandMutationResult {
+      const code = normalizeSessionCode(rawCode);
+      return runInTransaction<HandMutationResult>(() => {
+        const sessionRow = selectSessionStmt.get(code) as
+          | { status: SessionStatus; ledger_seq: number }
+          | undefined;
+        const latestHandRow = getLatestHandRow(code);
+        const seatRows = selectSeatsStmt.all(code) as unknown as StoredSeatRow[];
+        const check = validateUndoState(code, sessionRow, latestHandRow, seatRows);
+        if (!check.ok) {
+          return check;
+        }
+
+        const now = new Date().toISOString();
+        syncSeatsFromHand(code, check.restoredHand);
+        deleteCheckpointStmt.run(code, check.restoredHand.handNumber, check.maxStep);
+        updateHandStmt.run(
+          check.restoredHand.status,
+          check.restoredHand.buttonSeatNumber,
+          JSON.stringify(check.restoredHand),
+          now,
+          check.sessionLedgerSeq,
+          code,
+          check.restoredHand.handNumber,
+        );
+
+        const updated = getSession(code);
+        if (!updated) {
+          throw new Error(`Session ${code} disappeared during undoHandStep`);
+        }
+        return { ok: true, hand: check.restoredHand, session: updated };
+      });
+    },
+
+    getSessionHands(rawCode): GetSessionHandsResponse | null {
+      const code = normalizeSessionCode(rawCode);
+      const meta = getSessionMeta(code);
+      if (!meta) {
+        return null;
+      }
+      const { handHistory, sessionStats } = getHandHistoryAndStats(code);
+      return {
+        hands: handHistory,
+        sessionStats,
+      };
     },
 
     close(): void {
@@ -1662,5 +1942,8 @@ export function toSessionSnapshot(
     ledgerEntries: stored.ledgerEntries,
     hand: stored.hand,
     handInProgress: isHandInProgress(stored.hand),
+    canUndo: stored.canUndo,
+    handHistory: stored.handHistory,
+    sessionStats: stored.sessionStats,
   };
 }

@@ -466,6 +466,18 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         return;
       }
 
+      const handsMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/hands$/);
+      if (method === "GET" && handsMatch) {
+        const code = normalizeSessionCode(handsMatch[1] ?? "");
+        const result = storage.getSessionHands(code);
+        if (!result) {
+          sendJson(res, 404, { error: "Session not found." });
+          return;
+        }
+        sendJson(res, 200, result);
+        return;
+      }
+
       const claimMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/seats\/claim$/);
       if (method === "POST" && claimMatch) {
         const code = normalizeSessionCode(claimMatch[1] ?? "");
@@ -1026,6 +1038,27 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
           winnerSeatNumbers: payload.winnerSeatNumbers,
           potId: typeof payload.potId === "string" ? payload.potId : undefined,
         });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
+        sendJson(res, 200, {
+          hand: result.hand,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const undoHandMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/hand\/undo$/);
+      if (method === "POST" && undoHandMatch) {
+        const ctx = requireHostForSession(req, res, undoHandMatch[1] ?? "", "undo a Hand step");
+        if (!ctx) {
+          return;
+        }
+
+        const result = storage.undoHandStep(ctx.code);
         if (!result.ok) {
           sendStorageFailure(res, result.reason, result.error);
           return;

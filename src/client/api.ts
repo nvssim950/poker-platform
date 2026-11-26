@@ -11,6 +11,7 @@ import {
   type CreateSessionInput,
   type CreateSessionResponse,
   type DirectCashOutResponse,
+  type GetSessionHandsResponse,
   type GetSessionResponse,
   type RecordDirectLedgerInput,
   type RecordDirectLedgerResponse,
@@ -29,6 +30,7 @@ import {
   type StartHandResponse,
   type SubmitHandActionInput,
   type SubmitHandActionResponse,
+  type UndoHandResponse,
 } from "../shared/session.ts";
 
 export interface StoredSessionTokens {
@@ -300,6 +302,21 @@ export const sessionApi = {
       body: JSON.stringify(input),
     });
     return parseJsonOrThrow<ResolveShowdownResponse>(res);
+  },
+
+  async undoHandStep(code: string, tokens: StoredSessionTokens): Promise<UndoHandResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/hand/undo`, {
+      method: "POST",
+      headers: authHeaders(tokens),
+    });
+    return parseJsonOrThrow<UndoHandResponse>(res);
+  },
+
+  async getSessionHands(code: string): Promise<GetSessionHandsResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/hands`);
+    return parseJsonOrThrow<GetSessionHandsResponse>(res);
   },
 
   async setSitOut(

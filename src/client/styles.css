@@ -421,3 +421,31 @@ body {
   accent-color: var(--accent);
   flex-shrink: 0;
 }
+
+.hand-history-card {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.history-detail {
+  width: 100%;
+  margin-top: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.history-section {
+  display: flex;
+  flex-direction: column;
+}
+
+.history-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}

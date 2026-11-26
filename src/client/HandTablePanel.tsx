@@ -8,54 +8,16 @@ import {
   getLegalActions,
   getLivePots,
   getTotalPotChips,
-  type HandActionRecord,
   type HandPot,
-  type HandSeatState,
   type PlayerActionType,
-  type Street,
 } from "../shared/handEngine.ts";
 import type { SessionSnapshot, ViewerIdentity } from "../shared/session.ts";
 import { loadSessionTokens, sessionApi } from "./api.ts";
-
-const STREET_LABELS: Record<Street, string> = {
-  PREFLOP: "Preflop",
-  FLOP: "Flop",
-  TURN: "Turn",
-  RIVER: "River",
-};
-
-function formatActionSummary(record: HandActionRecord): string {
-  const seatLabel = `Seat ${record.seatNumber} (${record.displayName})`;
-  const proxyTag = record.byHostProxy ? " · Host Proxy" : "";
-  switch (record.action) {
-    case "FOLD":
-      return `${STREET_LABELS[record.street]} · ${seatLabel} Folded${proxyTag}`;
-    case "CHECK":
-      return `${STREET_LABELS[record.street]} · ${seatLabel} Checked${proxyTag}`;
-    case "CALL":
-      return `${STREET_LABELS[record.street]} · ${seatLabel} Called ${record.amountChips} Chips${proxyTag}`;
-    case "BET":
-      return `${STREET_LABELS[record.street]} · ${seatLabel} Bet ${record.amountChips} Chips${proxyTag}`;
-    case "RAISE":
-      return `${STREET_LABELS[record.street]} · ${seatLabel} Raised to ${record.amountChips} Chips${proxyTag}`;
-    case "ALL_IN":
-      return `${STREET_LABELS[record.street]} · ${seatLabel} All-In (${record.amountChips} Chips)${proxyTag}`;
-    case "STRADDLE":
-      return `${STREET_LABELS[record.street]} · ${seatLabel} Straddled ${record.amountChips} Chips${proxyTag}`;
-  }
-}
-
-function formatEligibleSeatList(
-  seatNumbers: readonly number[],
-  seats: readonly HandSeatState[],
-): string {
-  return seatNumbers
-    .map((seatNumber) => {
-      const seat = seats.find((s) => s.seatNumber === seatNumber);
-      return seat ? `Seat ${seatNumber} (${seat.displayName})` : `Seat ${seatNumber}`;
-    })
-    .join(", ");
-}
+import {
+  formatActionSummary,
+  formatEligibleSeatList,
+  STREET_LABELS,
+} from "./handFormat.ts";
 
 export function HandTablePanel({
   session,
@@ -216,6 +178,19 @@ export function HandTablePanel({
     }
   }
 
+  async function handleUndoHandStep(): Promise<void> {
+    onError(null);
+    setSubmitting(true);
+    try {
+      const res = await sessionApi.undoHandStep(session.code, loadSessionTokens(session.code));
+      onSessionUpdate(res.session);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Unable to undo Hand step.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   function toggleWinnerSeat(potId: string, seatNumber: number): void {
     setSelectedWinnersByPot((prev) => {
       const current = prev[potId] ?? [];
@@ -334,11 +309,29 @@ export function HandTablePanel({
       {hand && hand.status === "COMPLETE" && hand.result && (
         <div className="card">
           <div className="brand-bar" style={{ marginBottom: "10px" }}>
-            <h3 style={{ margin: 0 }}>Hand #{hand.handNumber} Complete</h3>
-            <span className="pill pill-live">
-              {hand.result.reason === "FOLD_WIN" ? "Fold-Win" : "Showdown"} ·{" "}
-              {hand.result.totalPotChips} Chips
-            </span>
+            <div>
+              <h3 style={{ margin: "0 0 4px" }}>Hand #{hand.handNumber} Complete</h3>
+              <span className="pill pill-live">
+                {hand.result.reason === "FOLD_WIN" ? "Fold-Win" : "Showdown"} ·{" "}
+                {hand.result.totalPotChips} Chips
+              </span>
+            </div>
+            {viewer.isHost && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                style={{ flexShrink: 0 }}
+                disabled={submitting || !session.canUndo}
+                title={
+                  session.canUndo
+                    ? "Undo resolution and rewind to previous state"
+                    : "Undo locked after subsequent Buy-In, Rebuy, Top-Up, or Cash-Out"
+                }
+                onClick={() => void handleUndoHandStep()}
+              >
+                Undo
+              </button>
+            )}
           </div>
           <div className="seat-list">
             {hand.result.awards.map((award) => (
@@ -363,6 +356,11 @@ export function HandTablePanel({
               Uncalled {hand.result.uncalledReturned.amountChips} Chips returned to Seat{" "}
               {hand.result.uncalledReturned.seatNumber} ({hand.result.uncalledReturned.displayName}
               ).
+            </div>
+          )}
+          {viewer.isHost && !session.canUndo && (
+            <div className="seat-sub" style={{ marginTop: "8px" }}>
+              Undo unavailable after post-Hand ledger or Cash-Out activity.
             </div>
           )}
         </div>
@@ -393,6 +391,22 @@ export function HandTablePanel({
                 {hand.isHeadsUp && <span className="pill">Heads-Up</span>}
               </div>
             </div>
+            {viewer.isHost && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                style={{ flexShrink: 0 }}
+                disabled={submitting || !session.canUndo}
+                title={
+                  session.canUndo
+                    ? "Undo last Action, Street transition, or Showdown step"
+                    : "At start of current Hand; nothing left to undo"
+                }
+                onClick={() => void handleUndoHandStep()}
+              >
+                Undo
+              </button>
+            )}
           </div>
 
           {hand.dealPrompt && (

@@ -104,6 +104,12 @@ export interface SeatView {
   occupant: SeatOccupant | null;
 }
 
+export interface SessionStats {
+  handsPlayed: number;
+  biggestPotChips: number;
+  biggestHandNumber: number | null;
+}
+
 export interface SessionSnapshot {
   code: string;
   status: SessionStatus;
@@ -116,6 +122,10 @@ export interface SessionSnapshot {
   ledgerEntries: LedgerEntryView[];
   hand: HandState | null;
   handInProgress: boolean;
+  canUndo: boolean;
+  /** Completed Hands ordered newest-first (`handNumber` descending). */
+  handHistory: HandState[];
+  sessionStats: SessionStats;
 }
 
 export interface ViewerIdentity {
@@ -237,6 +247,17 @@ export interface ResolveShowdownInput {
 export interface ResolveShowdownResponse {
   hand: HandState;
   session: SessionSnapshot;
+}
+
+export interface UndoHandResponse {
+  hand: HandState;
+  session: SessionSnapshot;
+}
+
+export interface GetSessionHandsResponse {
+  /** Completed Hands ordered newest-first (`handNumber` descending). */
+  hands: HandState[];
+  sessionStats: SessionStats;
 }
 
 export interface SetSitOutInput {
