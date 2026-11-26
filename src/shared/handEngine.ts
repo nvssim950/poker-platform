@@ -2,7 +2,14 @@ import type { SeatView, SessionConfig } from "./session.ts";
 
 export type Street = "PREFLOP" | "FLOP" | "TURN" | "RIVER";
 export type HandStatus = "BETTING" | "SHOWDOWN" | "COMPLETE";
-export type PlayerActionType = "FOLD" | "CHECK" | "CALL" | "BET" | "RAISE" | "ALL_IN";
+export type PlayerActionType =
+  | "FOLD"
+  | "CHECK"
+  | "CALL"
+  | "BET"
+  | "RAISE"
+  | "ALL_IN"
+  | "STRADDLE";
 
 export interface HandSeatState {
   seatNumber: number;
@@ -10,6 +17,7 @@ export interface HandSeatState {
   displayName: string;
   startingChips: number;
   chips: number;
+  anteCommittedChips: number;
   streetCommittedChips: number;
   totalCommittedChips: number;
   hasFolded: boolean;
@@ -72,6 +80,10 @@ export interface HandState {
   isHeadsUp: boolean;
   actingSeatNumber: number | null;
   potChips: number;
+  deadPotChips: number;
+  bbAnteChips: number;
+  straddleSeatNumber: number | null;
+  runItTwice: boolean;
   currentBet: number;
   lastFullRaiseBet: number;
   lastFullRaiseIncrement: number;
@@ -102,6 +114,8 @@ export interface LegalActionsInfo {
   canAllIn: boolean;
   allInTo: number | null;
   allInAddedChips: number | null;
+  canStraddle: boolean;
+  straddleChips: number | null;
   smallestChipStep: number;
 }
 
@@ -190,14 +204,36 @@ export function determineNextButtonSeat(
 }
 
 /**
- * Computes the total live Chips currently in the Pot (center pot plus current Street wagers).
+ * Backfills optional house-rule defaults on persisted HandState snapshots.
+ */
+export function normalizeHandState(
+  raw: Omit<HandState, "deadPotChips" | "bbAnteChips" | "straddleSeatNumber" | "runItTwice" | "seats"> &
+    Partial<Pick<HandState, "deadPotChips" | "bbAnteChips" | "straddleSeatNumber" | "runItTwice">> & {
+      seats: Array<Omit<HandSeatState, "anteCommittedChips"> & Partial<Pick<HandSeatState, "anteCommittedChips">>>;
+    },
+): HandState {
+  return {
+    ...raw,
+    deadPotChips: raw.deadPotChips ?? 0,
+    bbAnteChips: raw.bbAnteChips ?? 0,
+    straddleSeatNumber: raw.straddleSeatNumber ?? null,
+    runItTwice: raw.runItTwice ?? false,
+    seats: raw.seats.map((s) => ({
+      ...s,
+      anteCommittedChips: s.anteCommittedChips ?? 0,
+    })),
+  };
+}
+
+/**
+ * Computes the total live Chips currently in the Pot (center pot, dead Ante pot, plus current Street wagers).
  */
 export function getTotalPotChips(hand: HandState): number {
   if (hand.status === "COMPLETE") {
     return 0;
   }
   const streetTotal = hand.seats.reduce((sum, seat) => sum + seat.streetCommittedChips, 0);
-  return hand.potChips + streetTotal;
+  return hand.potChips + hand.deadPotChips + streetTotal;
 }
 
 /**
@@ -330,16 +366,46 @@ function slicePotsByLevels(
   return pots;
 }
 
+function attachDeadPotToMainPot(
+  pots: HandPot[],
+  nonFolded: readonly HandSeatState[],
+  deadPotChips: number,
+): HandPot[] {
+  if (deadPotChips <= 0 || nonFolded.length === 0) {
+    return pots;
+  }
+  if (pots.length > 0) {
+    pots[0]!.amountChips += deadPotChips;
+    return pots;
+  }
+  return [
+    {
+      id: "main",
+      label: "Main Pot",
+      amountChips: deadPotChips,
+      eligibleSeatNumbers: nonFolded.map((s) => s.seatNumber),
+      winnerSeatNumbers: null,
+    },
+  ];
+}
+
 /**
  * Slices total Hand commitments into Main Pot and any Side Pots for Showdown resolution.
  */
-export function buildShowdownPots(seats: readonly HandSeatState[]): HandPot[] {
+export function buildShowdownPots(
+  seats: readonly HandSeatState[],
+  deadPotChips = 0,
+): HandPot[] {
   const nonFolded = seats.filter((s) => !s.hasFolded);
   const distinctLevels = Array.from(
     new Set(nonFolded.map((s) => s.totalCommittedChips).filter((amt) => amt > 0)),
   ).sort((a, b) => a - b);
 
-  return slicePotsByLevels(seats, distinctLevels, false);
+  return attachDeadPotToMainPot(
+    slicePotsByLevels(seats, distinctLevels, false),
+    nonFolded,
+    deadPotChips,
+  );
 }
 
 /**
@@ -361,7 +427,7 @@ export function getLivePots(hand: HandState): HandPot[] {
 
   const maxCommitted = Math.max(0, ...nonFolded.map((s) => s.totalCommittedChips));
   if (maxCommitted === 0) {
-    return [];
+    return attachDeadPotToMainPot([], nonFolded, hand.deadPotChips);
   }
 
   const allInCaps = Array.from(
@@ -377,7 +443,11 @@ export function getLivePots(hand: HandState): HandPot[] {
     levels.push(maxCommitted);
   }
 
-  return slicePotsByLevels(hand.seats, levels, true);
+  return attachDeadPotToMainPot(
+    slicePotsByLevels(hand.seats, levels, true),
+    nonFolded,
+    hand.deadPotChips,
+  );
 }
 
 function returnUncalledStreetExcess(hand: HandState): UncalledReturnView | null {
@@ -438,9 +508,10 @@ function settleClosedStreet(hand: HandState, config: SessionConfig): void {
   const contenders = hand.seats.filter((s) => !s.hasFolded);
   if (contenders.length === 1) {
     const winner = contenders[0]!;
-    const awardedPot = hand.potChips;
+    const awardedPot = hand.potChips + hand.deadPotChips;
     winner.chips += awardedPot;
     hand.potChips = 0;
+    hand.deadPotChips = 0;
     hand.status = "COMPLETE";
     hand.actingSeatNumber = null;
     hand.currentBet = 0;
@@ -486,7 +557,10 @@ function settleClosedStreet(hand: HandState, config: SessionConfig): void {
     hand.lastFullRaiseBet = 0;
     hand.lastFullRaiseIncrement = config.bigBlind;
     hand.dealPrompt = dealPrompt;
-    hand.pots = buildShowdownPots(hand.seats);
+    hand.pots = buildShowdownPots(hand.seats, hand.deadPotChips);
+    hand.potChips += hand.deadPotChips;
+    hand.deadPotChips = 0;
+    hand.runItTwice = false;
 
     const autoAwards: PotAwardView[] = [];
     for (const pot of hand.pots) {
@@ -555,13 +629,49 @@ function settleClosedStreet(hand: HandState, config: SessionConfig): void {
 }
 
 /**
- * Starts a new No-Limit Hold'em Hand, rotating the Moving Button and posting blinds automatically.
+ * Returns the UTG Seat number eligible for voluntary Straddle (null in Heads-Up).
+ */
+export function getUtgSeatNumber(
+  hand: Pick<HandState, "seats" | "buttonSeatNumber" | "isHeadsUp">,
+  seatCount: number,
+): number | null {
+  if (hand.isHeadsUp || hand.seats.length < 3) {
+    return null;
+  }
+  const ordered = orderSeatsStartingAt(hand.seats, hand.buttonSeatNumber, seatCount);
+  return ordered[3 % ordered.length]?.seatNumber ?? null;
+}
+
+function applyStraddleCommitment(
+  hand: HandState,
+  utgSeat: HandSeatState,
+  bigBlind: number,
+): number {
+  const straddleAmount = 2 * bigBlind;
+  utgSeat.chips -= straddleAmount;
+  utgSeat.streetCommittedChips += straddleAmount;
+  utgSeat.totalCommittedChips += straddleAmount;
+  if (utgSeat.chips === 0) {
+    utgSeat.isAllIn = true;
+  }
+  utgSeat.hasActedThisStreet = false;
+  utgSeat.hasActedSinceFullRaise = false;
+  hand.currentBet = straddleAmount;
+  hand.lastFullRaiseBet = straddleAmount;
+  hand.lastFullRaiseIncrement = bigBlind;
+  hand.straddleSeatNumber = utgSeat.seatNumber;
+  return straddleAmount;
+}
+
+/**
+ * Starts a new No-Limit Hold'em Hand, rotating the Moving Button and posting Antes, blinds, and optional Straddle.
  */
 export function startHand(params: {
   handNumber: number;
   config: SessionConfig;
   seats: readonly SeatView[];
   previousButtonSeatNumber: number | null;
+  postStraddle?: boolean | undefined;
 }): HandEngineResult<HandState> {
   const eligible = getEligibleSeatsForNewHand(params.seats);
   if (eligible.length < 2) {
@@ -584,6 +694,7 @@ export function startHand(params: {
     displayName: s.displayName,
     startingChips: s.chips,
     chips: s.chips,
+    anteCommittedChips: 0,
     streetCommittedChips: 0,
     totalCommittedChips: 0,
     hasFolded: false,
@@ -593,6 +704,21 @@ export function startHand(params: {
   }));
 
   const ordered = orderSeatsStartingAt(initialSeats, buttonSeatNumber, params.config.seatCount);
+
+  let perSeatAntePot = 0;
+  if (params.config.anteMode === "PER_SEAT" && params.config.anteChips > 0) {
+    for (const seat of ordered) {
+      const antePosted = Math.min(seat.chips, params.config.anteChips);
+      seat.chips -= antePosted;
+      seat.anteCommittedChips += antePosted;
+      seat.totalCommittedChips += antePosted;
+      if (seat.chips === 0) {
+        seat.isAllIn = true;
+      }
+      perSeatAntePot += antePosted;
+    }
+  }
+
   const sbSeat = isHeadsUp ? ordered[0]! : ordered[1]!;
   const bbSeat = isHeadsUp ? ordered[1]! : ordered[2]!;
   const firstPreflopSeat = isHeadsUp ? ordered[0]! : ordered[3 % ordered.length]!;
@@ -613,6 +739,18 @@ export function startHand(params: {
     bbSeat.isAllIn = true;
   }
 
+  let deadPotChips = 0;
+  let bbAnteChips = 0;
+  if (params.config.anteMode === "BIG_BLIND_ANTE" && params.config.anteChips > 0) {
+    const bbaPosted = Math.min(bbSeat.chips, params.config.anteChips);
+    bbSeat.chips -= bbaPosted;
+    if (bbSeat.chips === 0) {
+      bbSeat.isAllIn = true;
+    }
+    deadPotChips = bbaPosted;
+    bbAnteChips = bbaPosted;
+  }
+
   const hand: HandState = {
     handNumber: params.handNumber,
     status: "BETTING",
@@ -627,7 +765,11 @@ export function startHand(params: {
       params.config.seatCount,
       true,
     ),
-    potChips: 0,
+    potChips: perSeatAntePot,
+    deadPotChips,
+    bbAnteChips,
+    straddleSeatNumber: null,
+    runItTwice: false,
     currentBet: Math.max(sbPosted, bbPosted),
     lastFullRaiseBet: params.config.bigBlind,
     lastFullRaiseIncrement: params.config.bigBlind,
@@ -638,6 +780,38 @@ export function startHand(params: {
     lastUncalledReturned: null,
     result: null,
   };
+
+  if (params.postStraddle) {
+    if (!params.config.allowStraddle) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "Straddles are not enabled in this Session.",
+      };
+    }
+    if (isHeadsUp || ordered.length < 3) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "At least 3 active Seats are required to post a Straddle.",
+      };
+    }
+    const straddleRequired = 2 * params.config.bigBlind;
+    if (firstPreflopSeat.chips < straddleRequired) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: `UTG Seat ${firstPreflopSeat.seatNumber} needs at least ${straddleRequired} Chips to post a Straddle.`,
+      };
+    }
+    applyStraddleCommitment(hand, firstPreflopSeat, params.config.bigBlind);
+    hand.actingSeatNumber = findFirstEligibleActorFrom(
+      hand.seats,
+      firstPreflopSeat.seatNumber,
+      params.config.seatCount,
+      false,
+    );
+  }
 
   if (isStreetBettingClosed(hand)) {
     settleClosedStreet(hand, params.config);
@@ -702,6 +876,18 @@ export function getLegalActions(
         ? seat.chips > 0
         : !seat.hasActedSinceFullRaise && hasActiveOpponentWithChips;
 
+  const utgSeatNumber = getUtgSeatNumber(hand, config.seatCount);
+  const canStraddle =
+    config.allowStraddle &&
+    hand.street === "PREFLOP" &&
+    !hand.isHeadsUp &&
+    hand.seats.length >= 3 &&
+    hand.actionHistory.length === 0 &&
+    hand.straddleSeatNumber === null &&
+    utgSeatNumber === seatNumber &&
+    hand.actingSeatNumber === seatNumber &&
+    seat.chips >= 2 * config.bigBlind;
+
   return {
     seatNumber,
     toCall,
@@ -721,6 +907,8 @@ export function getLegalActions(
     canAllIn,
     allInTo: canAllIn ? maxStreetBet : null,
     allInAddedChips: canAllIn ? seat.chips : null,
+    canStraddle,
+    straddleChips: canStraddle ? 2 * config.bigBlind : null,
     smallestChipStep: config.smallestChipStep,
   };
 }
@@ -732,7 +920,8 @@ function isPlayerActionType(value: unknown): value is PlayerActionType {
     value === "CALL" ||
     value === "BET" ||
     value === "RAISE" ||
-    value === "ALL_IN"
+    value === "ALL_IN" ||
+    value === "STRADDLE"
   );
 }
 
@@ -818,7 +1007,7 @@ export function applyHandAction(
     return {
       ok: false,
       reason: "VALIDATION",
-      error: "Action must be FOLD, CHECK, CALL, BET, RAISE, or ALL_IN.",
+      error: "Action must be FOLD, CHECK, CALL, BET, RAISE, ALL_IN, or STRADDLE.",
     };
   }
   if (currentHand.actingSeatNumber !== input.seatNumber) {
@@ -932,6 +1121,56 @@ export function applyHandAction(
     hand.lastFullRaiseBet = target.value;
     hand.lastFullRaiseIncrement = target.value - oldCurrentBet;
     reopenRaisingForOthers(hand, seat.seatNumber);
+  } else if (action === "STRADDLE") {
+    if (!config.allowStraddle) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "Straddles are not enabled in this Session.",
+      };
+    }
+    if (hand.street !== "PREFLOP" || hand.isHeadsUp || hand.seats.length < 3) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "UTG Straddle is only allowed Preflop with at least 3 active Seats.",
+      };
+    }
+    if (hand.actionHistory.length > 0 || hand.straddleSeatNumber !== null) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "UTG Straddle is only available on the very first turn of Preflop.",
+      };
+    }
+    if (seat.seatNumber !== getUtgSeatNumber(hand, config.seatCount)) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: "Only the UTG Seat can post a Straddle.",
+      };
+    }
+    const straddleAmount = 2 * config.bigBlind;
+    if (
+      input.amountChips !== undefined &&
+      input.amountChips !== null &&
+      input.amountChips !== straddleAmount
+    ) {
+      return {
+        ok: false,
+        reason: "VALIDATION",
+        error: `Straddle amount must be ${straddleAmount} Chips (2× Big Blind).`,
+      };
+    }
+    if (seat.chips < straddleAmount) {
+      return {
+        ok: false,
+        reason: "CONFLICT",
+        error: `UTG Seat ${seat.seatNumber} needs at least ${straddleAmount} Chips to post a Straddle.`,
+      };
+    }
+    addedChips = applyStraddleCommitment(hand, seat, config.bigBlind);
+    recordedAmount = addedChips;
   } else {
     if (!legal.canAllIn || legal.allInTo === null || legal.allInAddedChips === null) {
       const blockedByShortAllIn =
@@ -1174,6 +1413,156 @@ export function resolveShowdown(
       awards: allAwards,
       uncalledReturned: hand.lastUncalledReturned,
     };
+  }
+
+  return { ok: true, value: hand };
+}
+
+/**
+ * Returns true when an all-in Showdown can currently toggle Run It Twice mode.
+ */
+export function canRunItTwice(hand: HandState, config: SessionConfig): boolean {
+  if (!config.allowRunItTwice || hand.status !== "SHOWDOWN") {
+    return false;
+  }
+  const contendersWithChips = hand.seats.filter((s) => !s.hasFolded && !s.isAllIn && s.chips > 0);
+  if (contendersWithChips.length >= 2) {
+    return false;
+  }
+  const contestedPots = hand.pots.filter((p) => p.eligibleSeatNumbers.length >= 2);
+  return contestedPots.length > 0 && contestedPots.every((p) => p.winnerSeatNumbers === null);
+}
+
+function splitPotForRunItTwice(pot: HandPot, smallestChipStep: number): HandPot[] {
+  const totalUnits = Math.floor(pot.amountChips / smallestChipStep);
+  const subStep = pot.amountChips % smallestChipStep;
+  const run1Amount = Math.ceil(totalUnits / 2) * smallestChipStep + subStep;
+  const run2Amount = Math.floor(totalUnits / 2) * smallestChipStep;
+
+  const subPots: HandPot[] = [
+    {
+      id: `${pot.id}-run-1`,
+      label: `${pot.label} (Run 1)`,
+      amountChips: run1Amount,
+      eligibleSeatNumbers: [...pot.eligibleSeatNumbers],
+      winnerSeatNumbers: null,
+    },
+  ];
+  if (run2Amount > 0) {
+    subPots.push({
+      id: `${pot.id}-run-2`,
+      label: `${pot.label} (Run 2)`,
+      amountChips: run2Amount,
+      eligibleSeatNumbers: [...pot.eligibleSeatNumbers],
+      winnerSeatNumbers: null,
+    });
+  }
+  return subPots;
+}
+
+function mergeRunItTwicePots(pots: readonly HandPot[]): HandPot[] {
+  const merged: HandPot[] = [];
+  for (const pot of pots) {
+    if (pot.id.endsWith("-run-2")) {
+      continue;
+    }
+    if (pot.id.endsWith("-run-1")) {
+      const baseId = pot.id.slice(0, -"-run-1".length);
+      const baseLabel = pot.label.endsWith(" (Run 1)")
+        ? pot.label.slice(0, -" (Run 1)".length)
+        : pot.label;
+      const run2 = pots.find((p) => p.id === `${baseId}-run-2`);
+      merged.push({
+        id: baseId,
+        label: baseLabel,
+        amountChips: pot.amountChips + (run2 ? run2.amountChips : 0),
+        eligibleSeatNumbers: [...pot.eligibleSeatNumbers],
+        winnerSeatNumbers: null,
+      });
+      continue;
+    }
+    merged.push({
+      ...pot,
+      eligibleSeatNumbers: [...pot.eligibleSeatNumbers],
+      winnerSeatNumbers: pot.winnerSeatNumbers ? [...pot.winnerSeatNumbers] : null,
+    });
+  }
+  return merged;
+}
+
+/**
+ * Toggles Run It Twice mode at an eligible all-in Showdown before any contested Pot is resolved.
+ */
+export function setRunItTwice(
+  currentHand: HandState,
+  config: SessionConfig,
+  enabled: unknown,
+): HandEngineResult<HandState> {
+  if (typeof enabled !== "boolean") {
+    return { ok: false, reason: "VALIDATION", error: "enabled must be a boolean." };
+  }
+  if (currentHand.status !== "SHOWDOWN") {
+    return {
+      ok: false,
+      reason: "CONFLICT",
+      error: "Run It Twice can only be toggled at Showdown.",
+    };
+  }
+  if (!config.allowRunItTwice) {
+    return {
+      ok: false,
+      reason: "CONFLICT",
+      error: "Run It Twice is not enabled in this Session.",
+    };
+  }
+  const contendersWithChips = currentHand.seats.filter(
+    (s) => !s.hasFolded && !s.isAllIn && s.chips > 0,
+  );
+  if (contendersWithChips.length >= 2) {
+    return {
+      ok: false,
+      reason: "CONFLICT",
+      error: "Run It Twice is only available when all remaining Players are All-In or betting is closed on All-Ins.",
+    };
+  }
+  const contestedPots = currentHand.pots.filter((p) => p.eligibleSeatNumbers.length >= 2);
+  if (contestedPots.length === 0) {
+    return {
+      ok: false,
+      reason: "CONFLICT",
+      error: "No contested Showdown Pot is available for Run It Twice.",
+    };
+  }
+  if (contestedPots.some((p) => p.winnerSeatNumbers !== null)) {
+    return {
+      ok: false,
+      reason: "CONFLICT",
+      error: "Cannot change Run It Twice mode after a Showdown Pot has been resolved.",
+    };
+  }
+
+  const hand = cloneHandState(currentHand);
+  if (hand.runItTwice === enabled) {
+    return { ok: true, value: hand };
+  }
+
+  if (enabled) {
+    const nextPots: HandPot[] = [];
+    for (const pot of hand.pots) {
+      if (pot.eligibleSeatNumbers.length < 2) {
+        nextPots.push(pot);
+      } else {
+        nextPots.push(...splitPotForRunItTwice(pot, config.smallestChipStep));
+      }
+    }
+    hand.pots = nextPots;
+    hand.runItTwice = true;
+    hand.dealPrompt =
+      "Run It Twice — Deal two independent boards, then select Showdown winner(s) for Run 1 & Run 2.";
+  } else {
+    hand.pots = mergeRunItTwicePots(hand.pots);
+    hand.runItTwice = false;
+    hand.dealPrompt = SHOWDOWN_PROMPTS.RIVER;
   }
 
   return { ok: true, value: hand };

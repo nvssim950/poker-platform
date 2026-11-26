@@ -317,6 +317,90 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
     return { code, seatNumber: viewer.seatNumber, playerId: viewer.playerId, payload };
   }
 
+  async function handleHandActionRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+    rawCode: string,
+    forcedAction?: "STRADDLE",
+  ): Promise<void> {
+    const code = normalizeSessionCode(rawCode);
+    const stored = storage.getSession(code);
+    if (!stored) {
+      sendJson(res, 404, { error: "Session not found." });
+      return;
+    }
+
+    const hostToken = readHeaderToken(req, "x-host-token");
+    const seatToken = readHeaderToken(req, "x-seat-token");
+    const viewer = resolveSessionViewer(stored, hostToken, seatToken);
+    if (!viewer.isHost && viewer.seatNumber === null) {
+      sendJson(res, 403, { error: "Seat or Host token is required to submit a Hand Action." });
+      return;
+    }
+
+    const body = await readJsonBodyOr400(req, res);
+    if (body === undefined) {
+      return;
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      sendJson(res, 400, { error: "Action payload must be an object." });
+      return;
+    }
+    const payload = body as Record<string, unknown>;
+
+    let targetSeatNumber: number;
+    let byHostProxy = false;
+
+    if (viewer.isHost) {
+      if (payload.seatNumber !== undefined) {
+        if (
+          typeof payload.seatNumber !== "number" ||
+          !Number.isInteger(payload.seatNumber) ||
+          payload.seatNumber < 1 ||
+          payload.seatNumber > stored.config.seatCount
+        ) {
+          sendJson(res, 400, {
+            error: `Seat number must be between 1 and ${stored.config.seatCount}.`,
+          });
+          return;
+        }
+        targetSeatNumber = payload.seatNumber;
+        byHostProxy = viewer.seatNumber !== targetSeatNumber;
+      } else if (forcedAction === "STRADDLE" && stored.hand?.actingSeatNumber != null) {
+        targetSeatNumber = stored.hand.actingSeatNumber;
+        byHostProxy = viewer.seatNumber !== targetSeatNumber;
+      } else if (viewer.seatNumber !== null) {
+        targetSeatNumber = viewer.seatNumber;
+      } else {
+        sendJson(res, 400, { error: "Seat number is required for Host proxy Action." });
+        return;
+      }
+    } else {
+      if (payload.seatNumber !== undefined && payload.seatNumber !== viewer.seatNumber) {
+        sendJson(res, 403, { error: "Players can only submit Actions for their own Seat." });
+        return;
+      }
+      targetSeatNumber = viewer.seatNumber!;
+    }
+
+    const result = storage.applyHandAction(code, {
+      seatNumber: targetSeatNumber,
+      action: forcedAction ?? payload.action,
+      amountChips: payload.amountChips,
+      byHostProxy,
+    });
+    if (!result.ok) {
+      sendStorageFailure(res, result.reason, result.error);
+      return;
+    }
+
+    broadcastSession(code);
+    sendJson(res, 200, {
+      hand: result.hand,
+      session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+    });
+  }
+
   const server = createServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -846,7 +930,21 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
           return;
         }
 
-        const result = storage.startHand(ctx.code);
+        const body = await readJsonBodyOr400(req, res);
+        if (body === undefined) {
+          return;
+        }
+        if (typeof body !== "object" || body === null || Array.isArray(body)) {
+          sendJson(res, 400, { error: "Start Hand payload must be an object." });
+          return;
+        }
+        const postStraddle = (body as Record<string, unknown>).postStraddle;
+        if (postStraddle !== undefined && typeof postStraddle !== "boolean") {
+          sendJson(res, 400, { error: "postStraddle must be a boolean." });
+          return;
+        }
+
+        const result = storage.startHand(ctx.code, { postStraddle });
         if (!result.ok) {
           sendStorageFailure(res, result.reason, result.error);
           return;
@@ -862,18 +960,27 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
 
       const handActionMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/hand\/actions$/);
       if (method === "POST" && handActionMatch) {
-        const code = normalizeSessionCode(handActionMatch[1] ?? "");
-        const stored = storage.getSession(code);
-        if (!stored) {
-          sendJson(res, 404, { error: "Session not found." });
-          return;
-        }
+        await handleHandActionRequest(req, res, handActionMatch[1] ?? "");
+        return;
+      }
 
-        const hostToken = readHeaderToken(req, "x-host-token");
-        const seatToken = readHeaderToken(req, "x-seat-token");
-        const viewer = resolveSessionViewer(stored, hostToken, seatToken);
-        if (!viewer.isHost && viewer.seatNumber === null) {
-          sendJson(res, 403, { error: "Seat or Host token is required to submit a Hand Action." });
+      const handStraddleMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/hand\/straddle$/);
+      if (method === "POST" && handStraddleMatch) {
+        await handleHandActionRequest(req, res, handStraddleMatch[1] ?? "", "STRADDLE");
+        return;
+      }
+
+      const runItTwiceMatch = pathname.match(
+        /^\/api\/sessions\/([A-Za-z0-9]+)\/hand\/run-it-twice$/,
+      );
+      if (method === "POST" && runItTwiceMatch) {
+        const ctx = requireHostForSession(
+          req,
+          res,
+          runItTwiceMatch[1] ?? "",
+          "toggle Run It Twice",
+        );
+        if (!ctx) {
           return;
         }
 
@@ -882,55 +989,17 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
           return;
         }
         if (typeof body !== "object" || body === null || Array.isArray(body)) {
-          sendJson(res, 400, { error: "Action payload must be an object." });
+          sendJson(res, 400, { error: "Run It Twice payload must be an object." });
           return;
         }
-        const payload = body as Record<string, unknown>;
-
-        let targetSeatNumber: number;
-        let byHostProxy = false;
-
-        if (viewer.isHost) {
-          if (payload.seatNumber !== undefined) {
-            if (
-              typeof payload.seatNumber !== "number" ||
-              !Number.isInteger(payload.seatNumber) ||
-              payload.seatNumber < 1 ||
-              payload.seatNumber > stored.config.seatCount
-            ) {
-              sendJson(res, 400, {
-                error: `Seat number must be between 1 and ${stored.config.seatCount}.`,
-              });
-              return;
-            }
-            targetSeatNumber = payload.seatNumber;
-            byHostProxy = viewer.seatNumber !== targetSeatNumber;
-          } else if (viewer.seatNumber !== null) {
-            targetSeatNumber = viewer.seatNumber;
-          } else {
-            sendJson(res, 400, { error: "Seat number is required for Host proxy Action." });
-            return;
-          }
-        } else {
-          if (payload.seatNumber !== undefined && payload.seatNumber !== viewer.seatNumber) {
-            sendJson(res, 403, { error: "Players can only submit Actions for their own Seat." });
-            return;
-          }
-          targetSeatNumber = viewer.seatNumber!;
-        }
-
-        const result = storage.applyHandAction(code, {
-          seatNumber: targetSeatNumber,
-          action: payload.action,
-          amountChips: payload.amountChips,
-          byHostProxy,
-        });
+        const enabled = (body as Record<string, unknown>).enabled;
+        const result = storage.setRunItTwice(ctx.code, { enabled });
         if (!result.ok) {
           sendStorageFailure(res, result.reason, result.error);
           return;
         }
 
-        broadcastSession(code);
+        broadcastSession(ctx.code);
         sendJson(res, 200, {
           hand: result.hand,
           session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),

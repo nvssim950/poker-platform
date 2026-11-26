@@ -2,6 +2,7 @@ import type { HandState, PlayerActionType } from "./handEngine.ts";
 import type { SettlementSummary } from "./settlement.ts";
 
 export type SessionStatus = "ACTIVE" | "SETTLED";
+export type AnteMode = "NONE" | "PER_SEAT" | "BIG_BLIND_ANTE";
 
 export interface SessionConfig {
   seatCount: number;
@@ -13,6 +14,10 @@ export interface SessionConfig {
   exchangeRateCashMinor: number;
   minBuyInChips: number | null;
   maxBuyInChips: number | null;
+  anteMode: AnteMode;
+  anteChips: number;
+  allowStraddle: boolean;
+  allowRunItTwice: boolean;
 }
 
 export interface CreateSessionInput {
@@ -25,6 +30,10 @@ export interface CreateSessionInput {
   exchangeRateCashMinor: number;
   minBuyInChips?: number | null | undefined;
   maxBuyInChips?: number | null | undefined;
+  anteMode?: AnteMode | undefined;
+  anteChips?: number | undefined;
+  allowStraddle?: boolean | undefined;
+  allowRunItTwice?: boolean | undefined;
 }
 
 export type FundingKind = "BUY_IN" | "REBUY" | "TOP_UP";
@@ -191,6 +200,10 @@ export interface RecordDirectLedgerResponse {
   session: SessionSnapshot;
 }
 
+export interface StartHandInput {
+  postStraddle?: boolean | undefined;
+}
+
 export interface StartHandResponse {
   hand: HandState;
   session: SessionSnapshot;
@@ -203,6 +216,15 @@ export interface SubmitHandActionInput {
 }
 
 export interface SubmitHandActionResponse {
+  hand: HandState;
+  session: SessionSnapshot;
+}
+
+export interface SetRunItTwiceInput {
+  enabled: boolean;
+}
+
+export interface SetRunItTwiceResponse {
   hand: HandState;
   session: SessionSnapshot;
 }
@@ -293,6 +315,26 @@ function isStepMultiple(value: number, step: number): boolean {
   return value % step === 0;
 }
 
+function isAnteMode(value: unknown): value is AnteMode {
+  return value === "NONE" || value === "PER_SEAT" || value === "BIG_BLIND_ANTE";
+}
+
+/**
+ * Backfills optional house-rule defaults on persisted SessionConfig records.
+ */
+export function normalizeSessionConfig(
+  raw: Omit<SessionConfig, "anteMode" | "anteChips" | "allowStraddle" | "allowRunItTwice"> &
+    Partial<Pick<SessionConfig, "anteMode" | "anteChips" | "allowStraddle" | "allowRunItTwice">>,
+): SessionConfig {
+  return {
+    ...raw,
+    anteMode: raw.anteMode ?? "NONE",
+    anteChips: raw.anteChips ?? 0,
+    allowStraddle: raw.allowStraddle ?? false,
+    allowRunItTwice: raw.allowRunItTwice ?? false,
+  };
+}
+
 /**
  * Validates and normalizes Session creation configuration against tabletop domain invariants.
  */
@@ -348,6 +390,38 @@ export function validateSessionConfig(input: unknown): ValidationResult<SessionC
     return { ok: false, error: "Min Buy-In cannot exceed Max Buy-In." };
   }
 
+  const anteModeRaw = raw.anteMode ?? "NONE";
+  if (!isAnteMode(anteModeRaw)) {
+    return { ok: false, error: "Ante mode must be NONE, PER_SEAT, or BIG_BLIND_ANTE." };
+  }
+
+  let anteChips = 0;
+  if (anteModeRaw === "NONE") {
+    if (
+      raw.anteChips !== undefined &&
+      raw.anteChips !== null &&
+      (typeof raw.anteChips !== "number" || !Number.isInteger(raw.anteChips) || raw.anteChips < 0)
+    ) {
+      return { ok: false, error: "Ante Chips must be a non-negative integer." };
+    }
+    anteChips = 0;
+  } else {
+    if (!isPositiveInt(raw.anteChips) || !isStepMultiple(raw.anteChips, step)) {
+      return { ok: false, error: "Ante must be a positive multiple of the smallest Chip step." };
+    }
+    anteChips = raw.anteChips;
+  }
+
+  const allowStraddleRaw = raw.allowStraddle ?? false;
+  if (typeof allowStraddleRaw !== "boolean") {
+    return { ok: false, error: "allowStraddle must be a boolean." };
+  }
+
+  const allowRunItTwiceRaw = raw.allowRunItTwice ?? false;
+  if (typeof allowRunItTwiceRaw !== "boolean") {
+    return { ok: false, error: "allowRunItTwice must be a boolean." };
+  }
+
   return {
     ok: true,
     value: {
@@ -360,6 +434,10 @@ export function validateSessionConfig(input: unknown): ValidationResult<SessionC
       exchangeRateCashMinor: raw.exchangeRateCashMinor,
       minBuyInChips: minRaw,
       maxBuyInChips: maxRaw,
+      anteMode: anteModeRaw,
+      anteChips,
+      allowStraddle: allowStraddleRaw,
+      allowRunItTwice: allowRunItTwiceRaw,
     },
   };
 }

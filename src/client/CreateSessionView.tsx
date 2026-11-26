@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { normalizeSessionCode } from "../shared/session.ts";
+import { normalizeSessionCode, type AnteMode } from "../shared/session.ts";
 import { saveHostToken, sessionApi } from "./api.ts";
 
 export function CreateSessionView({
@@ -17,6 +17,10 @@ export function CreateSessionView({
   const [rateCashDecimal, setRateCashDecimal] = useState("1.00");
   const [minBuyIn, setMinBuyIn] = useState("500");
   const [maxBuyIn, setMaxBuyIn] = useState("2000");
+  const [anteMode, setAnteMode] = useState<AnteMode>("NONE");
+  const [anteChips, setAnteChips] = useState("0");
+  const [allowStraddle, setAllowStraddle] = useState(false);
+  const [allowRunItTwice, setAllowRunItTwice] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -41,6 +45,10 @@ export function CreateSessionView({
         exchangeRateCashMinor: parsedCashMinor,
         minBuyInChips: minBuyIn.trim() ? Number(minBuyIn) : null,
         maxBuyInChips: maxBuyIn.trim() ? Number(maxBuyIn) : null,
+        anteMode,
+        anteChips: anteMode === "NONE" ? 0 : Number(anteChips),
+        allowStraddle,
+        allowRunItTwice,
       });
       saveHostToken(created.session.code, created.hostToken);
       onOpenSession(created.session.code);
@@ -188,6 +196,57 @@ export function CreateSessionView({
                 onChange={(e) => setMaxBuyIn(e.target.value)}
               />
             </div>
+            <div className="field">
+              <label htmlFor="ante-mode">Ante Rule</label>
+              <select
+                id="ante-mode"
+                value={anteMode}
+                onChange={(e) => {
+                  const next = e.target.value as AnteMode;
+                  setAnteMode(next);
+                  if (next === "NONE") {
+                    setAnteChips("0");
+                  } else if (Number(anteChips) <= 0 || !Number.isFinite(Number(anteChips))) {
+                    setAnteChips(next === "BIG_BLIND_ANTE" ? bigBlind : smallestChipStep);
+                  }
+                }}
+              >
+                <option value="NONE">Off (No Ante)</option>
+                <option value="PER_SEAT">Every-Seat Ante</option>
+                <option value="BIG_BLIND_ANTE">Big Blind Ante</option>
+              </select>
+            </div>
+            <div className="field">
+              <label htmlFor="ante-chips">Ante (Chips)</label>
+              <input
+                id="ante-chips"
+                type="number"
+                min={anteMode === "NONE" ? 0 : 1}
+                disabled={anteMode === "NONE"}
+                value={anteMode === "NONE" ? "0" : anteChips}
+                onChange={(e) => setAnteChips(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="toggle-list">
+            <label className="toggle-row" htmlFor="allow-straddle">
+              <input
+                id="allow-straddle"
+                type="checkbox"
+                checked={allowStraddle}
+                onChange={(e) => setAllowStraddle(e.target.checked)}
+              />
+              <span>Allow voluntary UTG Straddle (2× Big Blind)</span>
+            </label>
+            <label className="toggle-row" htmlFor="allow-rit">
+              <input
+                id="allow-rit"
+                type="checkbox"
+                checked={allowRunItTwice}
+                onChange={(e) => setAllowRunItTwice(e.target.checked)}
+              />
+              <span>Allow Run It Twice on all-in Showdowns</span>
+            </label>
           </div>
           <button type="submit" className="btn btn-primary" disabled={submitting}>
             {submitting ? "Creating Session..." : "Open Session"}

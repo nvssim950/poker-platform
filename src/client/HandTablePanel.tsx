@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  canRunItTwice,
   clockwiseLeftOfButtonOffset,
   computePotSplitAwards,
   determineNextButtonSeat,
@@ -39,6 +40,8 @@ function formatActionSummary(record: HandActionRecord): string {
       return `${STREET_LABELS[record.street]} · ${seatLabel} Raised to ${record.amountChips} Chips${proxyTag}`;
     case "ALL_IN":
       return `${STREET_LABELS[record.street]} · ${seatLabel} All-In (${record.amountChips} Chips)${proxyTag}`;
+    case "STRADDLE":
+      return `${STREET_LABELS[record.street]} · ${seatLabel} Straddled ${record.amountChips} Chips${proxyTag}`;
   }
 }
 
@@ -69,6 +72,7 @@ export function HandTablePanel({
   const [wagerText, setWagerText] = useState("");
   const [selectedWinnersByPot, setSelectedWinnersByPot] = useState<Record<string, number[]>>({});
   const [showActionLog, setShowActionLog] = useState(false);
+  const [postStraddleOnStart, setPostStraddleOnStart] = useState(false);
 
   const hand = session.hand;
   const eligibleSeats = getEligibleSeatsForNewHand(session.seats);
@@ -79,6 +83,28 @@ export function HandTablePanel({
           hand?.buttonSeatNumber ?? null,
         )
       : null;
+
+  const nextUtgSeat =
+    session.config.allowStraddle && eligibleSeats.length >= 3 && nextButtonSeat !== null
+      ? [...eligibleSeats].sort((a, b) => {
+          const offA =
+            a.seatNumber === nextButtonSeat
+              ? 0
+              : clockwiseLeftOfButtonOffset(a.seatNumber, nextButtonSeat, session.config.seatCount);
+          const offB =
+            b.seatNumber === nextButtonSeat
+              ? 0
+              : clockwiseLeftOfButtonOffset(b.seatNumber, nextButtonSeat, session.config.seatCount);
+          return offA - offB;
+        })[3 % eligibleSeats.length] ?? null
+      : null;
+  const nextUtgChipsAfterAnte = nextUtgSeat
+    ? session.config.anteMode === "PER_SEAT"
+      ? Math.max(0, nextUtgSeat.chips - session.config.anteChips)
+      : nextUtgSeat.chips
+    : 0;
+  const nextUtgCanStraddle =
+    nextUtgSeat !== null && nextUtgChipsAfterAnte >= 2 * session.config.bigBlind;
 
   const actingSeat =
     hand && hand.actingSeatNumber !== null
@@ -117,10 +143,33 @@ export function HandTablePanel({
     onError(null);
     setSubmitting(true);
     try {
-      const res = await sessionApi.startHand(session.code, loadSessionTokens(session.code));
+      const useStraddle = postStraddleOnStart && nextUtgCanStraddle;
+      const res = await sessionApi.startHand(
+        session.code,
+        loadSessionTokens(session.code),
+        useStraddle ? { postStraddle: true } : undefined,
+      );
+      setPostStraddleOnStart(false);
       onSessionUpdate(res.session);
     } catch (err) {
       onError(err instanceof Error ? err.message : "Unable to start Hand.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function handleToggleRunItTwice(enabled: boolean): Promise<void> {
+    onError(null);
+    setSubmitting(true);
+    try {
+      const res = await sessionApi.setRunItTwice(
+        session.code,
+        { enabled },
+        loadSessionTokens(session.code),
+      );
+      onSessionUpdate(res.session);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Unable to update Run It Twice.");
     } finally {
       setSubmitting(false);
     }
@@ -229,6 +278,8 @@ export function HandTablePanel({
     !legal.canRaise &&
     actingSeat.chips > legal.toCall;
 
+  const ritEligible = hand !== null && canRunItTwice(hand, session.config);
+
   return (
     <>
       {!session.handInProgress && (
@@ -245,6 +296,25 @@ export function HandTablePanel({
               </div>
             </div>
           </div>
+
+          {viewer.isHost && session.config.allowStraddle && eligibleSeats.length >= 3 && nextUtgSeat && (
+            <div className="toggle-list">
+              <label className="toggle-row" htmlFor="start-hand-straddle">
+                <input
+                  id="start-hand-straddle"
+                  type="checkbox"
+                  checked={postStraddleOnStart && nextUtgCanStraddle}
+                  disabled={!nextUtgCanStraddle}
+                  onChange={(e) => setPostStraddleOnStart(e.target.checked)}
+                />
+                <span>
+                  Post UTG Straddle ({2 * session.config.bigBlind} Chips · Seat{" "}
+                  {nextUtgSeat.seatNumber} {nextUtgSeat.displayName})
+                  {!nextUtgCanStraddle ? " — insufficient Chips" : ""}
+                </span>
+              </label>
+            </div>
+          )}
 
           {viewer.isHost && (
             <button
@@ -312,6 +382,14 @@ export function HandTablePanel({
                 <span className="pill">
                   SB {hand.sbSeatNumber} / BB {hand.bbSeatNumber}
                 </span>
+                {hand.bbAnteChips > 0 && <span className="pill">BB Ante {hand.bbAnteChips}</span>}
+                {session.config.anteMode === "PER_SEAT" && session.config.anteChips > 0 && (
+                  <span className="pill">Ante {session.config.anteChips}/Seat</span>
+                )}
+                {hand.straddleSeatNumber !== null && (
+                  <span className="pill">Straddle Seat {hand.straddleSeatNumber}</span>
+                )}
+                {hand.runItTwice && <span className="pill pill-live">Run It Twice</span>}
                 {hand.isHeadsUp && <span className="pill">Heads-Up</span>}
               </div>
             </div>
@@ -392,12 +470,16 @@ export function HandTablePanel({
                       )}
                       {seat.seatNumber === hand.sbSeatNumber && <span className="pill">SB</span>}
                       {seat.seatNumber === hand.bbSeatNumber && <span className="pill">BB</span>}
+                      {seat.seatNumber === hand.straddleSeatNumber && (
+                        <span className="pill">STR</span>
+                      )}
                       {isActing && <span className="pill pill-live">Acting</span>}
                       {seat.hasFolded && <span className="pill">Folded</span>}
                       {seat.isAllIn && <span className="pill pill-warn">All-In</span>}
                     </div>
                     <div className="seat-sub">
                       Stack: {seat.chips} Chips
+                      {seat.anteCommittedChips > 0 ? ` · Ante: ${seat.anteCommittedChips} Chips` : ""}
                       {seat.streetCommittedChips > 0
                         ? ` · Street Bet: ${seat.streetCommittedChips} Chips`
                         : ""}
@@ -537,12 +619,53 @@ export function HandTablePanel({
                     All-In ({legal.allInAddedChips})
                   </button>
                 )}
+
+                {legal.canStraddle && legal.straddleChips !== null && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    disabled={submitting}
+                    onClick={() => void handleAction("STRADDLE")}
+                  >
+                    Straddle ({legal.straddleChips})
+                  </button>
+                )}
               </div>
             </div>
           )}
 
           {hand.status === "SHOWDOWN" && hand.pots.length > 0 && (
             <div className="pot-list">
+              {(ritEligible || hand.runItTwice) && (
+                <div className="pot-card">
+                  <div
+                    className="seat-title"
+                    style={{ justifyContent: "space-between", width: "100%" }}
+                  >
+                    <span>Run It Twice</span>
+                    {viewer.isHost && ritEligible ? (
+                      <button
+                        type="button"
+                        className={`btn btn-sm ${hand.runItTwice ? "btn-primary" : "btn-secondary"}`}
+                        disabled={submitting}
+                        style={{ width: "auto" }}
+                        onClick={() => void handleToggleRunItTwice(!hand.runItTwice)}
+                      >
+                        {hand.runItTwice ? "Run It Twice: ON" : "Enable Run It Twice"}
+                      </button>
+                    ) : (
+                      <span className={`pill ${hand.runItTwice ? "pill-live" : ""}`}>
+                        {hand.runItTwice ? "Active" : "Single Run"}
+                      </span>
+                    )}
+                  </div>
+                  <div className="seat-sub">
+                    {hand.runItTwice
+                      ? "Contested Pots are split into Run 1 and Run 2 with independent winner selections."
+                      : "All-in Showdown eligible — Host can toggle Run It Twice to split contested Pots."}
+                  </div>
+                </div>
+              )}
               {hand.pots.map((pot) => {
                 const isResolved = pot.winnerSeatNumbers !== null;
                 const isAutoAwarded = isResolved && pot.eligibleSeatNumbers.length === 1;

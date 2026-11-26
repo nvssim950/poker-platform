@@ -317,6 +317,14 @@ export function SessionLobbyView({
               Buy-In {session.config.minBuyInChips ?? "0"}–{session.config.maxBuyInChips ?? "∞"}
             </span>
           )}
+          {session.config.anteMode === "PER_SEAT" && session.config.anteChips > 0 && (
+            <span className="pill">Ante {session.config.anteChips}/Seat</span>
+          )}
+          {session.config.anteMode === "BIG_BLIND_ANTE" && session.config.anteChips > 0 && (
+            <span className="pill">BB Ante {session.config.anteChips}</span>
+          )}
+          {session.config.allowStraddle && <span className="pill">Straddle</span>}
+          {session.config.allowRunItTwice && <span className="pill">Run It Twice</span>}
         </div>
 
         {showInvite && (
@@ -523,6 +531,9 @@ export function SessionLobbyView({
                         )}
                         {activeHand?.bbSeatNumber === seat.seatNumber && (
                           <span className="pill">BB</span>
+                        )}
+                        {activeHand?.straddleSeatNumber === seat.seatNumber && (
+                          <span className="pill">STR</span>
                         )}
                         {isActing && <span className="pill pill-live">Acting</span>}
                         {seat.occupant.hasPendingRelink && (

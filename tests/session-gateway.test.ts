@@ -130,6 +130,10 @@ describe("Authoritative Session Gateway", () => {
       exchangeRateCashMinor: 100,
       minBuyInChips: 500,
       maxBuyInChips: 2000,
+      anteMode: "NONE",
+      anteChips: 0,
+      allowStraddle: false,
+      allowRunItTwice: false,
     });
     assert.deepEqual(
       created.session.seats.map((s) => s.seatNumber),

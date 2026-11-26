@@ -3,12 +3,15 @@ import { DatabaseSync } from "node:sqlite";
 import {
   applyHandAction as applyHandActionEngine,
   isHandInProgress,
+  normalizeHandState,
   resolveShowdown as resolveShowdownEngine,
+  setRunItTwice as setRunItTwiceEngine,
   startHand as startHandEngine,
   type HandState,
 } from "../shared/handEngine.ts";
 import {
   normalizeSessionCode,
+  normalizeSessionConfig,
   validateFundingOperation,
   type BuyInRequestView,
   type CashOutRecordView,
@@ -224,7 +227,7 @@ export interface SessionStorage {
     },
   ): DirectCashOutResult;
   settleSession(code: string): SettleSessionResult;
-  startHand(code: string): HandMutationResult;
+  startHand(code: string, params?: { postStraddle?: boolean | undefined }): HandMutationResult;
   applyHandAction(
     code: string,
     params: {
@@ -232,6 +235,12 @@ export interface SessionStorage {
       action: unknown;
       amountChips?: unknown;
       byHostProxy?: boolean;
+    },
+  ): HandMutationResult;
+  setRunItTwice(
+    code: string,
+    params: {
+      enabled: unknown;
     },
   ): HandMutationResult;
   resolveShowdown(
@@ -540,7 +549,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
 
   function getLatestHand(code: string): HandState | null {
     const row = selectLatestHandStmt.get(code) as { state_json: string } | undefined;
-    return row ? (JSON.parse(row.state_json) as HandState) : null;
+    return row ? normalizeHandState(JSON.parse(row.state_json) as HandState) : null;
   }
 
   function getSession(rawCode: string): StoredSession | null {
@@ -569,7 +578,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       code: row.code,
       hostToken: row.host_token,
       status: row.status,
-      config: JSON.parse(row.config_json) as SessionConfig,
+      config: normalizeSessionConfig(JSON.parse(row.config_json) as SessionConfig),
       seats,
       pendingRequests: pendingRows.map(mapBuyInRequestRow),
       pendingCashOutRequests: pendingCashOutRows.map(mapCashOutRequestRow),
@@ -601,7 +610,10 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       | { config_json: string; status: SessionStatus }
       | undefined;
     return row
-      ? { config: JSON.parse(row.config_json) as SessionConfig, status: row.status }
+      ? {
+          config: normalizeSessionConfig(JSON.parse(row.config_json) as SessionConfig),
+          status: row.status,
+        }
       : null;
   }
 
@@ -1510,7 +1522,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       });
     },
 
-    startHand(rawCode): HandMutationResult {
+    startHand(rawCode, params): HandMutationResult {
       const code = normalizeSessionCode(rawCode);
       return runInTransaction<HandMutationResult>(() => {
         const activeMeta = requireActiveSessionMeta(code);
@@ -1527,6 +1539,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
           config: activeMeta.config,
           seats: mapSeatRowsToViews(seatRows),
           previousButtonSeatNumber: latestHand ? latestHand.buttonSeatNumber : null,
+          postStraddle: params?.postStraddle,
         });
         if (!started.ok) {
           return started;
@@ -1558,6 +1571,15 @@ export function createSessionStorage(dbPath: string): SessionStorage {
         "BETTING",
         "No active Hand is currently in a betting Street.",
         (hand, config) => applyHandActionEngine(hand, config, params),
+      );
+    },
+
+    setRunItTwice(rawCode, params): HandMutationResult {
+      return mutateLatestHand(
+        rawCode,
+        "SHOWDOWN",
+        "No Hand is currently awaiting Showdown.",
+        (hand, config) => setRunItTwiceEngine(hand, config, params.enabled),
       );
     },
 

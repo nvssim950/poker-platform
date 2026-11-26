@@ -20,9 +20,12 @@ import {
   type RelinkSeatResponse,
   type ResolveShowdownInput,
   type ResolveShowdownResponse,
+  type SetRunItTwiceInput,
+  type SetRunItTwiceResponse,
   type SetSitOutInput,
   type SetSitOutResponse,
   type SettleSessionResponse,
+  type StartHandInput,
   type StartHandResponse,
   type SubmitHandActionInput,
   type SubmitHandActionResponse,
@@ -229,11 +232,21 @@ export const sessionApi = {
     return parseJsonOrThrow<RecordDirectLedgerResponse>(res);
   },
 
-  async startHand(code: string, tokens: StoredSessionTokens): Promise<StartHandResponse> {
+  async startHand(
+    code: string,
+    tokens: StoredSessionTokens,
+    input?: StartHandInput,
+  ): Promise<StartHandResponse> {
     const normalized = normalizeSessionCode(code);
     const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/hand/start`, {
       method: "POST",
-      headers: authHeaders(tokens),
+      headers: input
+        ? {
+            "content-type": "application/json",
+            ...authHeaders(tokens),
+          }
+        : authHeaders(tokens),
+      ...(input ? { body: JSON.stringify(input) } : {}),
     });
     return parseJsonOrThrow<StartHandResponse>(res);
   },
@@ -253,6 +266,23 @@ export const sessionApi = {
       body: JSON.stringify(input),
     });
     return parseJsonOrThrow<SubmitHandActionResponse>(res);
+  },
+
+  async setRunItTwice(
+    code: string,
+    input: SetRunItTwiceInput,
+    tokens: StoredSessionTokens,
+  ): Promise<SetRunItTwiceResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/hand/run-it-twice`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...authHeaders(tokens),
+      },
+      body: JSON.stringify(input),
+    });
+    return parseJsonOrThrow<SetRunItTwiceResponse>(res);
   },
 
   async resolveShowdown(
