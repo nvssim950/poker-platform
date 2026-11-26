@@ -29,6 +29,12 @@ _Avoid_: Admin, moderator, banker
 **Seat**:
 A numbered table position in a **Session** that can be open, occupied by an active **Player**, or sitting out.
 
+**Release**:
+A **Host** action that vacates an occupied **Seat** back to open and revokes its **Player** reconnect token.
+
+**Re-link**:
+A **Host** action that revokes a seated **Player**'s current reconnect token and issues a one-time transfer link so the **Player** can reclaim their **Seat** on another device.
+
 **Buy-In**:
 A recorded acquisition of **Chips** by a **Player** during a **Session**, adding to their **Cash** obligation on the ledger.
 _Avoid_: Deposit, load

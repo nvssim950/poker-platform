@@ -1,0 +1,142 @@
+import {
+  normalizeSessionCode,
+  type ClaimSeatInput,
+  type ClaimSeatResponse,
+  type CreateSessionInput,
+  type CreateSessionResponse,
+  type GetSessionResponse,
+  type ReleaseSeatResponse,
+  type RelinkSeatResponse,
+} from "../shared/session.ts";
+
+export interface StoredSessionTokens {
+  hostToken: string | null;
+  seatToken: string | null;
+}
+
+function tokenStorageKey(code: string, kind: "hostToken" | "seatToken"): string {
+  return `poker_session_${normalizeSessionCode(code)}_${kind}`;
+}
+
+export function loadSessionTokens(code: string): StoredSessionTokens {
+  return {
+    hostToken: window.localStorage.getItem(tokenStorageKey(code, "hostToken")),
+    seatToken: window.localStorage.getItem(tokenStorageKey(code, "seatToken")),
+  };
+}
+
+export function saveHostToken(code: string, hostToken: string): void {
+  window.localStorage.setItem(tokenStorageKey(code, "hostToken"), hostToken);
+}
+
+export function saveSeatToken(code: string, seatToken: string | null): void {
+  const key = tokenStorageKey(code, "seatToken");
+  if (seatToken === null) {
+    window.localStorage.removeItem(key);
+  } else {
+    window.localStorage.setItem(key, seatToken);
+  }
+}
+
+async function parseJsonOrThrow<T>(response: Response): Promise<T> {
+  const data = (await response.json()) as T & { error?: string };
+  if (!response.ok) {
+    throw new Error(data.error ?? `Request failed (${response.status})`);
+  }
+  return data;
+}
+
+function authHeaders(tokens: StoredSessionTokens): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (tokens.hostToken) {
+    headers["x-host-token"] = tokens.hostToken;
+  }
+  if (tokens.seatToken) {
+    headers["x-seat-token"] = tokens.seatToken;
+  }
+  return headers;
+}
+
+const inflightRelinkRedemptions = new Map<string, Promise<ClaimSeatResponse>>();
+
+export const sessionApi = {
+  async createSession(input: CreateSessionInput): Promise<CreateSessionResponse> {
+    const res = await fetch("/api/sessions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    return parseJsonOrThrow<CreateSessionResponse>(res);
+  },
+
+  async getSession(code: string, tokens: StoredSessionTokens): Promise<GetSessionResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}`, {
+      headers: authHeaders(tokens),
+    });
+    return parseJsonOrThrow<GetSessionResponse>(res);
+  },
+
+  async claimSeat(code: string, input: ClaimSeatInput): Promise<ClaimSeatResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/seats/claim`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    });
+    return parseJsonOrThrow<ClaimSeatResponse>(res);
+  },
+
+  async releaseSeat(
+    code: string,
+    seatNumber: number,
+    tokens: StoredSessionTokens,
+  ): Promise<ReleaseSeatResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/seats/${seatNumber}/release`,
+      {
+        method: "POST",
+        headers: authHeaders(tokens),
+      },
+    );
+    return parseJsonOrThrow<ReleaseSeatResponse>(res);
+  },
+
+  async relinkSeat(
+    code: string,
+    seatNumber: number,
+    tokens: StoredSessionTokens,
+  ): Promise<RelinkSeatResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(normalized)}/seats/${seatNumber}/relink`,
+      {
+        method: "POST",
+        headers: authHeaders(tokens),
+      },
+    );
+    return parseJsonOrThrow<RelinkSeatResponse>(res);
+  },
+
+  redeemRelink(code: string, relinkCode: string): Promise<ClaimSeatResponse> {
+    const normalized = normalizeSessionCode(code);
+    const key = `${normalized}:${relinkCode}`;
+    const existing = inflightRelinkRedemptions.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const request = fetch(`/api/sessions/${encodeURIComponent(normalized)}/relink/redeem`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ relinkCode }),
+    }).then((res) => parseJsonOrThrow<ClaimSeatResponse>(res));
+
+    inflightRelinkRedemptions.set(key, request);
+    request.catch(() => {
+      inflightRelinkRedemptions.delete(key);
+    });
+    return request;
+  },
+};
