@@ -194,6 +194,7 @@ export function LedgerPanel({
   const [hostAmount, setHostAmount] = useState("");
   const [submittingPlayer, setSubmittingPlayer] = useState(false);
   const [submittingHost, setSubmittingHost] = useState(false);
+  const [submittingCashOut, setSubmittingCashOut] = useState(false);
   const [resolvingRequestId, setResolvingRequestId] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
 
@@ -260,6 +261,44 @@ export function LedgerPanel({
     }
   }
 
+  async function handleHostResolveCashOut(
+    requestId: string,
+    decision: "approve" | "reject",
+  ): Promise<void> {
+    onError(null);
+    setResolvingRequestId(requestId);
+    try {
+      const tokens = loadSessionTokens(session.code);
+      const res =
+        decision === "approve"
+          ? await sessionApi.approveCashOutRequest(session.code, requestId, tokens)
+          : await sessionApi.rejectCashOutRequest(session.code, requestId, tokens);
+      onSessionUpdate(res.session);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : `Unable to ${decision} Cash-Out request.`);
+    } finally {
+      setResolvingRequestId(null);
+    }
+  }
+
+  async function handleRequestCashOut(): Promise<void> {
+    if (!mySeat) return;
+    onError(null);
+    setSubmittingCashOut(true);
+    try {
+      const res = await sessionApi.createCashOutRequest(
+        session.code,
+        {},
+        loadSessionTokens(session.code),
+      );
+      onSessionUpdate(res.session);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Unable to request Cash-Out.");
+    } finally {
+      setSubmittingCashOut(false);
+    }
+  }
+
   async function handleHostDirectSubmit(e: FormEvent): Promise<void> {
     e.preventDefault();
     if (!activeHostSeat || !hostOption || hostOption.disabledReason) return;
@@ -280,25 +319,73 @@ export function LedgerPanel({
     }
   }
 
+  const isSessionActive = session.status === "ACTIVE";
   const myPendingRequests = mySeat
     ? session.pendingRequests.filter((r) => r.seatNumber === mySeat.seatNumber)
     : [];
+  const myPendingCashOut = mySeat
+    ? session.pendingCashOutRequests.find((r) => r.seatNumber === mySeat.seatNumber) ?? null
+    : null;
+  const totalPendingCount =
+    session.pendingRequests.length + session.pendingCashOutRequests.length;
 
   const totalSessionBuyInChips = session.ledgerEntries.reduce(
     (sum, entry) => sum + entry.amountChips,
     0,
   );
   const totalTableChips = occupiedSeats.reduce((sum, s) => sum + s.occupant.chips, 0);
+  const totalCashedOutChips = session.cashOuts.reduce(
+    (sum, cashOut) => sum + cashOut.endingChips,
+    0,
+  );
 
   return (
     <>
-      {viewer.isHost && session.pendingRequests.length > 0 && (
+      {isSessionActive && viewer.isHost && totalPendingCount > 0 && (
         <div className="card">
           <div className="brand-bar" style={{ marginBottom: "10px" }}>
             <h3 style={{ margin: 0 }}>Pending Requests</h3>
-            <span className="pill pill-warn">{session.pendingRequests.length} Pending</span>
+            <span className="pill pill-warn">{totalPendingCount} Pending</span>
           </div>
           <div className="seat-list">
+            {session.pendingCashOutRequests.map((req) => (
+              <div key={req.id} className="seat-card">
+                <div className="seat-meta">
+                  <div className="seat-title">
+                    <span>Seat {req.seatNumber}</span>
+                    <span>· {req.displayName}</span>
+                    <span className="pill pill-warn">Cash-Out</span>
+                  </div>
+                  <div className="seat-sub">
+                    Stack: {req.chips} Chips ({formatChipsAsCash(req.chips, session.config)}) ·
+                    Buy-Ins: {req.totalBuyInChips} Chips
+                  </div>
+                </div>
+                <div className="seat-actions">
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    disabled={resolvingRequestId === req.id || session.handInProgress}
+                    title={
+                      session.handInProgress
+                        ? "Cash-Out can only be approved between Hands."
+                        : "Approve Cash-Out"
+                    }
+                    onClick={() => void handleHostResolveCashOut(req.id, "approve")}
+                  >
+                    Approve
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-danger btn-sm"
+                    disabled={resolvingRequestId === req.id}
+                    onClick={() => void handleHostResolveCashOut(req.id, "reject")}
+                  >
+                    Reject
+                  </button>
+                </div>
+              </div>
+            ))}
             {session.pendingRequests.map((req) => (
               <div key={req.id} className="seat-card">
                 <div className="seat-meta">
@@ -335,7 +422,7 @@ export function LedgerPanel({
         </div>
       )}
 
-      {mySeat && myOption && (
+      {isSessionActive && mySeat && myOption && (
         <div className="card">
           <h3>Your Chips &amp; Buy-In Ledger (Seat {mySeat.seatNumber})</h3>
           <div className="ledger-stats">
@@ -354,8 +441,22 @@ export function LedgerPanel({
             </div>
           </div>
 
-          {myPendingRequests.length > 0 && (
+          {(myPendingRequests.length > 0 || myPendingCashOut) && (
             <div className="seat-list" style={{ marginBottom: "12px" }}>
+              {myPendingCashOut && (
+                <div className="seat-card">
+                  <div className="seat-meta">
+                    <div className="seat-title">
+                      <span>Pending Cash-Out</span>
+                      <span className="pill pill-warn">Awaiting Host</span>
+                    </div>
+                    <div className="seat-sub">
+                      {myPendingCashOut.chips} Chips (
+                      {formatChipsAsCash(myPendingCashOut.chips, session.config)})
+                    </div>
+                  </div>
+                </div>
+              )}
               {myPendingRequests.map((req) => (
                 <div key={req.id} className="seat-card">
                   <div className="seat-meta">
@@ -385,10 +486,28 @@ export function LedgerPanel({
               submitting={submittingPlayer}
             />
           </form>
+
+          <div className="cashout-action-row">
+            <button
+              type="button"
+              className="btn btn-secondary btn-sm"
+              disabled={submittingCashOut || session.handInProgress || myPendingCashOut !== null}
+              onClick={() => void handleRequestCashOut()}
+            >
+              {submittingCashOut
+                ? "Requesting..."
+                : myPendingCashOut
+                  ? "Cash-Out Requested"
+                  : "Request Early Cash-Out"}
+            </button>
+            {session.handInProgress && (
+              <span className="seat-sub">Available between Hands</span>
+            )}
+          </div>
         </div>
       )}
 
-      {viewer.isHost && activeHostSeat && hostOption && (
+      {isSessionActive && viewer.isHost && activeHostSeat && hostOption && (
         <div className="card" id="host-ledger-entry">
           <h3>Host Direct Ledger Entry</h3>
           <div className="field">
@@ -449,12 +568,21 @@ export function LedgerPanel({
               {totalTableChips} Chips ({formatChipsAsCash(totalTableChips, session.config)})
             </strong>
           </div>
+          {session.cashOuts.length > 0 && (
+            <div className="ledger-stat">
+              <span className="seat-sub">Early Cash-Outs</span>
+              <strong>
+                {totalCashedOutChips} Chips (
+                {formatChipsAsCash(totalCashedOutChips, session.config)})
+              </strong>
+            </div>
+          )}
         </div>
 
-        {!viewer.isHost && session.pendingRequests.length > 0 && (
+        {isSessionActive && !viewer.isHost && totalPendingCount > 0 && (
           <div className="seat-sub" style={{ marginTop: "8px" }}>
-            {session.pendingRequests.length} pending funding{" "}
-            {session.pendingRequests.length === 1 ? "request" : "requests"} awaiting Host approval.
+            {totalPendingCount} pending{" "}
+            {totalPendingCount === 1 ? "request" : "requests"} awaiting Host approval.
           </div>
         )}
 

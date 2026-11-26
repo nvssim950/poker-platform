@@ -272,6 +272,51 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
     sendJson(res, status, { error });
   }
 
+  async function requireOwnSeatRequest(
+    req: IncomingMessage,
+    res: ServerResponse,
+    rawCode: string,
+    noun: string,
+  ): Promise<{
+    code: string;
+    seatNumber: number;
+    playerId: string;
+    payload: Record<string, unknown>;
+  } | null> {
+    const code = normalizeSessionCode(rawCode);
+    const stored = storage.getSession(code);
+    if (!stored) {
+      sendJson(res, 404, { error: "Session not found." });
+      return null;
+    }
+
+    const hostToken = readHeaderToken(req, "x-host-token");
+    const seatToken = readHeaderToken(req, "x-seat-token");
+    const viewer = resolveSessionViewer(stored, hostToken, seatToken);
+    if (viewer.seatNumber === null || viewer.playerId === null) {
+      sendJson(res, 403, { error: `A seated Player token is required to request ${noun}.` });
+      return null;
+    }
+
+    const body = await readJsonBodyOr400(req, res);
+    if (body === undefined) {
+      return null;
+    }
+    if (typeof body === "object" && body !== null && "seatNumber" in body) {
+      const requestedSeat = (body as Record<string, unknown>).seatNumber;
+      if (requestedSeat !== undefined && requestedSeat !== viewer.seatNumber) {
+        sendJson(res, 403, { error: `Players can only request ${noun} for their own Seat.` });
+        return null;
+      }
+    }
+
+    const payload = (typeof body === "object" && body !== null ? body : {}) as Record<
+      string,
+      unknown
+    >;
+    return { code, seatNumber: viewer.seatNumber, playerId: viewer.playerId, payload };
+  }
+
   const server = createServer(async (req, res) => {
     try {
       const method = req.method ?? "GET";
@@ -373,7 +418,14 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
           sendJson(
             res,
             result.reason === "NOT_FOUND" ? 404 : 409,
-            { error: result.reason === "NOT_FOUND" ? "Session not found." : "Seat is already occupied." },
+            {
+              error:
+                result.reason === "NOT_FOUND"
+                  ? "Session not found."
+                  : result.reason === "SETTLED"
+                    ? "Session is already settled."
+                    : "Seat is already occupied.",
+            },
           );
           return;
         }
@@ -462,8 +514,15 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         if (!result.ok) {
           sendJson(
             res,
-            404,
-            { error: result.reason === "NOT_FOUND" ? "Session not found." : "Relink code is invalid or expired." },
+            result.reason === "SETTLED" ? 409 : 404,
+            {
+              error:
+                result.reason === "NOT_FOUND"
+                  ? "Session not found."
+                  : result.reason === "SETTLED"
+                    ? "Session is already settled."
+                    : "Relink code is invalid or expired.",
+            },
           );
           return;
         }
@@ -478,9 +537,9 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         return;
       }
 
-      const buyInReqMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/buy-in-requests$/);
-      if (method === "POST" && buyInReqMatch) {
-        const code = normalizeSessionCode(buyInReqMatch[1] ?? "");
+      const sitOutMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/seats\/(\d+)\/sit-out$/);
+      if (method === "POST" && sitOutMatch) {
+        const code = normalizeSessionCode(sitOutMatch[1] ?? "");
         const stored = storage.getSession(code);
         if (!stored) {
           sendJson(res, 404, { error: "Session not found." });
@@ -490,8 +549,27 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         const hostToken = readHeaderToken(req, "x-host-token");
         const seatToken = readHeaderToken(req, "x-seat-token");
         const viewer = resolveSessionViewer(stored, hostToken, seatToken);
-        if (viewer.seatNumber === null || viewer.playerId === null) {
-          sendJson(res, 403, { error: "A seated Player token is required to request Chips." });
+        if (!viewer.isHost && viewer.seatNumber === null) {
+          sendJson(res, 403, {
+            error: "Host authority or a seated Player token is required to update Sit Out status.",
+          });
+          return;
+        }
+
+        const seatNumber = Number(sitOutMatch[2]);
+        if (
+          !Number.isInteger(seatNumber) ||
+          seatNumber < 1 ||
+          seatNumber > stored.config.seatCount
+        ) {
+          sendJson(res, 400, {
+            error: `Seat number must be between 1 and ${stored.config.seatCount}.`,
+          });
+          return;
+        }
+
+        if (!viewer.isHost && viewer.seatNumber !== seatNumber) {
+          sendJson(res, 403, { error: "Players can only change Sit Out status for their own Seat." });
           return;
         }
 
@@ -499,31 +577,53 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         if (body === undefined) {
           return;
         }
-        if (typeof body === "object" && body !== null && "seatNumber" in body) {
-          const requestedSeat = (body as Record<string, unknown>).seatNumber;
-          if (requestedSeat !== undefined && requestedSeat !== viewer.seatNumber) {
-            sendJson(res, 403, { error: "Players can only request Chips for their own Seat." });
-            return;
-          }
+        if (
+          typeof body !== "object" ||
+          body === null ||
+          Array.isArray(body) ||
+          typeof (body as Record<string, unknown>).isSittingOut !== "boolean"
+        ) {
+          sendJson(res, 400, { error: "isSittingOut must be a boolean." });
+          return;
         }
 
-        const payload = (typeof body === "object" && body !== null ? body : {}) as Record<
-          string,
-          unknown
-        >;
-        const result = storage.createBuyInRequest(code, {
-          id: randomUUID(),
-          seatNumber: viewer.seatNumber,
-          playerId: viewer.playerId,
-          kind: payload.kind,
-          amountChips: payload.amountChips,
-        });
+        const result = storage.setSeatSittingOut(
+          code,
+          seatNumber,
+          (body as { isSittingOut: boolean }).isSittingOut,
+        );
         if (!result.ok) {
           sendStorageFailure(res, result.reason, result.error);
           return;
         }
 
         broadcastSession(code);
+        sendJson(res, 200, {
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const buyInReqMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/buy-in-requests$/);
+      if (method === "POST" && buyInReqMatch) {
+        const ctx = await requireOwnSeatRequest(req, res, buyInReqMatch[1] ?? "", "Chips");
+        if (!ctx) {
+          return;
+        }
+
+        const result = storage.createBuyInRequest(ctx.code, {
+          id: randomUUID(),
+          seatNumber: ctx.seatNumber,
+          playerId: ctx.playerId,
+          kind: ctx.payload.kind,
+          amountChips: ctx.payload.amountChips,
+        });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
         sendJson(res, 201, {
           request: result.request,
           session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
@@ -570,6 +670,128 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         broadcastSession(ctx.code);
         sendJson(res, 200, {
           request: result.request,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const cashOutReqMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/cash-out-requests$/);
+      if (method === "POST" && cashOutReqMatch) {
+        const ctx = await requireOwnSeatRequest(req, res, cashOutReqMatch[1] ?? "", "Cash-Out");
+        if (!ctx) {
+          return;
+        }
+
+        const result = storage.createCashOutRequest(ctx.code, {
+          id: randomUUID(),
+          seatNumber: ctx.seatNumber,
+          playerId: ctx.playerId,
+        });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
+        sendJson(res, 201, {
+          request: result.request,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const resolveCashOutReqMatch = pathname.match(
+        /^\/api\/sessions\/([A-Za-z0-9]+)\/cash-out-requests\/([A-Za-z0-9-]+)\/(approve|reject)$/,
+      );
+      if (method === "POST" && resolveCashOutReqMatch) {
+        const action = resolveCashOutReqMatch[3] as "approve" | "reject";
+        const ctx = requireHostForSession(
+          req,
+          res,
+          resolveCashOutReqMatch[1] ?? "",
+          `${action} a Cash-Out request`,
+        );
+        if (!ctx) {
+          return;
+        }
+
+        const requestId = resolveCashOutReqMatch[2] ?? "";
+        if (action === "approve") {
+          const result = storage.approveCashOutRequest(ctx.code, requestId, randomUUID());
+          if (!result.ok) {
+            sendStorageFailure(res, result.reason, result.error);
+            return;
+          }
+          broadcastSession(ctx.code);
+          sendJson(res, 200, {
+            request: result.request,
+            cashOut: result.cashOut,
+            session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+          });
+          return;
+        }
+
+        const result = storage.rejectCashOutRequest(ctx.code, requestId);
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+        broadcastSession(ctx.code);
+        sendJson(res, 200, {
+          request: result.request,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const directCashOutMatch = pathname.match(
+        /^\/api\/sessions\/([A-Za-z0-9]+)\/seats\/(\d+)\/cash-out$/,
+      );
+      if (method === "POST" && directCashOutMatch) {
+        const ctx = requireHostForSeat(
+          req,
+          res,
+          directCashOutMatch[1] ?? "",
+          directCashOutMatch[2],
+          "cash out a Seat",
+        );
+        if (!ctx) {
+          return;
+        }
+
+        const result = storage.directCashOutSeat(ctx.code, {
+          cashOutId: randomUUID(),
+          seatNumber: ctx.seatNumber,
+        });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
+        sendJson(res, 200, {
+          cashOut: result.cashOut,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const settleMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/settle$/);
+      if (method === "POST" && settleMatch) {
+        const ctx = requireHostForSession(req, res, settleMatch[1] ?? "", "settle the Session");
+        if (!ctx) {
+          return;
+        }
+
+        const result = storage.settleSession(ctx.code);
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
+        sendJson(res, 200, {
+          settlement: result.settlement,
           session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
         });
         return;

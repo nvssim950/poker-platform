@@ -11,6 +11,7 @@ import {
 import { loadSessionTokens, saveHostToken, saveSeatToken, sessionApi } from "./api.ts";
 import { HandTablePanel } from "./HandTablePanel.tsx";
 import { LedgerPanel } from "./LedgerPanel.tsx";
+import { SettlementPanel } from "./SettlementPanel.tsx";
 
 function clearSeatTokenIfConfirmedInvalid(
   code: string,
@@ -220,6 +221,39 @@ export function SessionLobbyView({
     }
   }
 
+  async function handleToggleSitOut(seatNumber: number, isSittingOut: boolean): Promise<void> {
+    setError(null);
+    try {
+      const res = await sessionApi.setSitOut(
+        code,
+        seatNumber,
+        { isSittingOut },
+        loadSessionTokens(code),
+      );
+      setSession(res.session);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to update Sit Out status.");
+    }
+  }
+
+  async function handleHostDirectCashOut(seatNumber: number): Promise<void> {
+    setError(null);
+    try {
+      const res = await sessionApi.directCashOut(code, seatNumber, loadSessionTokens(code));
+      setSession(res.session);
+      if (relinkInfo?.seatNumber === seatNumber) {
+        setRelinkInfo(null);
+      }
+      if (viewer.seatNumber === seatNumber) {
+        saveSeatToken(code, null);
+        setViewer((prev) => ({ ...prev, seatNumber: null, playerId: null }));
+        syncSocketSubscription();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to cash out Seat.");
+    }
+  }
+
   if (!session) {
     return (
       <div className="card">
@@ -249,6 +283,7 @@ export function SessionLobbyView({
               {viewer.seatNumber !== null && (
                 <span className="pill pill-live">Seat {viewer.seatNumber}</span>
               )}
+              {session.status === "SETTLED" && <span className="pill pill-warn">Settled</span>}
             </div>
           </div>
           <div className="seat-actions">
@@ -369,7 +404,7 @@ export function SessionLobbyView({
         </div>
       )}
 
-      {claimingSeat !== null && (
+      {session.status === "ACTIVE" && claimingSeat !== null && (
         <div className="card">
           <h3>Claim Seat {claimingSeat}</h3>
           <form onSubmit={handleClaimSubmit}>
@@ -404,12 +439,23 @@ export function SessionLobbyView({
         </div>
       )}
 
-      <HandTablePanel
-        session={session}
-        viewer={viewer}
-        onSessionUpdate={setSession}
-        onError={setError}
-      />
+      {session.status === "SETTLED" && (
+        <SettlementPanel
+          session={session}
+          viewer={viewer}
+          onSessionUpdate={setSession}
+          onError={setError}
+        />
+      )}
+
+      {session.status === "ACTIVE" && (
+        <HandTablePanel
+          session={session}
+          viewer={viewer}
+          onSessionUpdate={setSession}
+          onError={setError}
+        />
+      )}
 
       <LedgerPanel
         session={session}
@@ -420,11 +466,21 @@ export function SessionLobbyView({
         onError={setError}
       />
 
+      {session.status === "ACTIVE" && (
+        <SettlementPanel
+          session={session}
+          viewer={viewer}
+          onSessionUpdate={setSession}
+          onError={setError}
+        />
+      )}
+
       <div className="card">
         <h3>Seats ({session.config.seatCount})</h3>
         <div className="seat-list">
           {session.seats.map((seat) => {
             const isMine = viewer.seatNumber === seat.seatNumber;
+            const isSessionActive = session.status === "ACTIVE";
             const activeHand = session.handInProgress ? session.hand : null;
             const isActing =
               activeHand !== null &&
@@ -456,6 +512,9 @@ export function SessionLobbyView({
                       <>
                         <span>· {seat.occupant.displayName}</span>
                         {isMine && <span className="pill pill-live">You</span>}
+                        {seat.occupant.isSittingOut && (
+                          <span className="pill pill-warn">Sitting Out</span>
+                        )}
                         {activeHand?.buttonSeatNumber === seat.seatNumber && (
                           <span className="pill">BTN</span>
                         )}
@@ -483,57 +542,91 @@ export function SessionLobbyView({
                   )}
                 </div>
 
-                <div className="seat-actions">
-                  {!seat.occupant && viewer.seatNumber === null && (
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => setClaimingSeat(seat.seatNumber)}
-                    >
-                      Claim
-                    </button>
-                  )}
-                  {seat.occupant && viewer.isHost && (
-                    <>
-                      {seatFunding && (
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-sm"
-                          disabled={seatFunding.disabledReason !== null}
-                          title={seatFunding.disabledReason ?? `Record ${seatFunding.label}`}
-                          onClick={() => {
-                            setSelectedHostSeat(seat.seatNumber);
-                            document
-                              .getElementById("host-ledger-entry")
-                              ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                          }}
-                        >
-                          +{seatFunding.label}
-                        </button>
-                      )}
+                {isSessionActive && (
+                  <div className="seat-actions">
+                    {!seat.occupant && viewer.seatNumber === null && (
                       <button
                         type="button"
                         className="btn btn-secondary btn-sm"
-                        onClick={() => void handleRelinkSeat(seat.seatNumber)}
+                        onClick={() => setClaimingSeat(seat.seatNumber)}
                       >
-                        Re-link
+                        Claim
                       </button>
+                    )}
+                    {seat.occupant && (isMine || viewer.isHost) && (
                       <button
                         type="button"
-                        className="btn btn-danger btn-sm"
-                        disabled={releaseBlocked}
+                        className="btn btn-secondary btn-sm"
+                        disabled={session.handInProgress}
                         title={
-                          releaseBlocked
-                            ? "Cannot release a Seat with Chips or recorded Buy-Ins"
-                            : "Release Seat"
+                          session.handInProgress
+                            ? "Sit Out can only be changed between Hands."
+                            : seat.occupant.isSittingOut
+                              ? "Return to active play"
+                              : "Sit Out next Hand"
                         }
-                        onClick={() => void handleReleaseSeat(seat.seatNumber)}
+                        onClick={() =>
+                          void handleToggleSitOut(seat.seatNumber, !seat.occupant!.isSittingOut)
+                        }
                       >
-                        Release
+                        {seat.occupant.isSittingOut ? "Return to Play" : "Sit Out"}
                       </button>
-                    </>
-                  )}
-                </div>
+                    )}
+                    {seat.occupant && viewer.isHost && (
+                      <>
+                        {seatFunding && (
+                          <button
+                            type="button"
+                            className="btn btn-secondary btn-sm"
+                            disabled={seatFunding.disabledReason !== null}
+                            title={seatFunding.disabledReason ?? `Record ${seatFunding.label}`}
+                            onClick={() => {
+                              setSelectedHostSeat(seat.seatNumber);
+                              document
+                                .getElementById("host-ledger-entry")
+                                ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                            }}
+                          >
+                            +{seatFunding.label}
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          disabled={session.handInProgress}
+                          title={
+                            session.handInProgress
+                              ? "Cash-Out is only allowed between Hands."
+                              : "Cash out Seat and lock Chips"
+                          }
+                          onClick={() => void handleHostDirectCashOut(seat.seatNumber)}
+                        >
+                          Cash-Out
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => void handleRelinkSeat(seat.seatNumber)}
+                        >
+                          Re-link
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          disabled={releaseBlocked}
+                          title={
+                            releaseBlocked
+                              ? "Cannot release a Seat with Chips or recorded Buy-Ins"
+                              : "Release Seat"
+                          }
+                          onClick={() => void handleReleaseSeat(seat.seatNumber)}
+                        >
+                          Release
+                        </button>
+                      </>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}

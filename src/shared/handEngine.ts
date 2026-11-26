@@ -160,7 +160,7 @@ export function getEligibleSeatsForNewHand(sessionSeats: readonly SeatView[]): E
   return sessionSeats
     .filter(
       (s): s is { seatNumber: number; occupant: NonNullable<SeatView["occupant"]> } =>
-        s.occupant !== null && s.occupant.chips > 0,
+        s.occupant !== null && s.occupant.chips > 0 && !s.occupant.isSittingOut,
     )
     .map((s) => ({
       seatNumber: s.seatNumber,

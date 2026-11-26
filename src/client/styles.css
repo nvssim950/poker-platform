@@ -366,3 +366,31 @@ body {
   border: 1px solid var(--border);
   border-radius: 10px;
 }
+
+.settlement-subheading {
+  margin: 0 0 8px;
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+
+.settlement-transfer-card {
+  border-color: rgba(52, 211, 153, 0.35);
+}
+
+.net-positive {
+  color: var(--accent);
+}
+
+.net-negative {
+  color: var(--danger);
+}
+
+.cashout-action-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}

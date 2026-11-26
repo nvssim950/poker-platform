@@ -1,4 +1,7 @@
 import type { HandState, PlayerActionType } from "./handEngine.ts";
+import type { SettlementSummary } from "./settlement.ts";
+
+export type SessionStatus = "ACTIVE" | "SETTLED";
 
 export interface SessionConfig {
   seatCount: number;
@@ -51,6 +54,32 @@ export interface LedgerEntryView {
   createdAt: string;
 }
 
+export type CashOutRequestStatus = "PENDING" | "APPROVED" | "REJECTED";
+export type CashOutSource = "REQUEST_APPROVAL" | "HOST_DIRECT";
+
+export interface CashOutRequestView {
+  id: string;
+  seatNumber: number;
+  playerId: string;
+  displayName: string;
+  chips: number;
+  totalBuyInChips: number;
+  status: CashOutRequestStatus;
+  createdAt: string;
+}
+
+export interface CashOutRecordView {
+  id: string;
+  seatNumber: number;
+  playerId: string;
+  displayName: string;
+  totalBuyInChips: number;
+  endingChips: number;
+  source: CashOutSource;
+  requestId: string | null;
+  cashedOutAt: string;
+}
+
 export interface SeatOccupant {
   playerId: string;
   displayName: string;
@@ -58,6 +87,7 @@ export interface SeatOccupant {
   totalBuyInChips: number;
   isConnected: boolean;
   hasPendingRelink: boolean;
+  isSittingOut: boolean;
 }
 
 export interface SeatView {
@@ -67,9 +97,13 @@ export interface SeatView {
 
 export interface SessionSnapshot {
   code: string;
+  status: SessionStatus;
   config: SessionConfig;
   seats: SeatView[];
   pendingRequests: BuyInRequestView[];
+  pendingCashOutRequests: CashOutRequestView[];
+  cashOuts: CashOutRecordView[];
+  settlement: SettlementSummary | null;
   ledgerEntries: LedgerEntryView[];
   hand: HandState | null;
   handInProgress: boolean;
@@ -180,6 +214,44 @@ export interface ResolveShowdownInput {
 
 export interface ResolveShowdownResponse {
   hand: HandState;
+  session: SessionSnapshot;
+}
+
+export interface SetSitOutInput {
+  isSittingOut: boolean;
+}
+
+export interface SetSitOutResponse {
+  session: SessionSnapshot;
+}
+
+export interface CreateCashOutRequestInput {
+  seatNumber?: number | undefined;
+}
+
+export interface CreateCashOutRequestResponse {
+  request: CashOutRequestView;
+  session: SessionSnapshot;
+}
+
+export interface ApproveCashOutRequestResponse {
+  request: CashOutRequestView;
+  cashOut: CashOutRecordView;
+  session: SessionSnapshot;
+}
+
+export interface RejectCashOutRequestResponse {
+  request: CashOutRequestView;
+  session: SessionSnapshot;
+}
+
+export interface DirectCashOutResponse {
+  cashOut: CashOutRecordView;
+  session: SessionSnapshot;
+}
+
+export interface SettleSessionResponse {
+  settlement: SettlementSummary;
   session: SessionSnapshot;
 }
 
