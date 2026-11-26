@@ -33,6 +33,7 @@ interface FundingAmountFieldsProps {
   idPrefix: string;
   config: SessionConfig;
   occupant: SeatOccupant;
+  handInProgress: boolean;
   option: AvailableFundingOption;
   amountText: string;
   onAmountChange: (value: string) => void;
@@ -44,6 +45,7 @@ function FundingAmountFields({
   idPrefix,
   config,
   occupant,
+  handInProgress,
   option,
   amountText,
   onAmountChange,
@@ -57,6 +59,7 @@ function FundingAmountFields({
       config,
       chips: occupant.chips,
       totalBuyInChips: occupant.totalBuyInChips,
+      handInProgress,
     },
   );
 
@@ -171,6 +174,7 @@ export function LedgerPanel({
         config: session.config,
         chips: mySeat.occupant.chips,
         totalBuyInChips: mySeat.occupant.totalBuyInChips,
+        handInProgress: session.handInProgress,
       })
     : null;
 
@@ -182,6 +186,7 @@ export function LedgerPanel({
         config: session.config,
         chips: activeHostSeat.occupant.chips,
         totalBuyInChips: activeHostSeat.occupant.totalBuyInChips,
+        handInProgress: session.handInProgress,
       })
     : null;
 
@@ -372,6 +377,7 @@ export function LedgerPanel({
               idPrefix="player-funding"
               config={session.config}
               occupant={mySeat.occupant}
+              handInProgress={session.handInProgress}
               option={myOption}
               amountText={playerAmount}
               onAmountChange={setPlayerAmount}
@@ -404,6 +410,7 @@ export function LedgerPanel({
               idPrefix="host-funding"
               config={session.config}
               occupant={activeHostSeat.occupant}
+              handInProgress={session.handInProgress}
               option={hostOption}
               amountText={hostAmount}
               onAmountChange={setHostAmount}

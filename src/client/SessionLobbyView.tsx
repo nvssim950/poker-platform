@@ -9,6 +9,7 @@ import {
   type ViewerIdentity,
 } from "../shared/session.ts";
 import { loadSessionTokens, saveHostToken, saveSeatToken, sessionApi } from "./api.ts";
+import { HandTablePanel } from "./HandTablePanel.tsx";
 import { LedgerPanel } from "./LedgerPanel.tsx";
 
 function clearSeatTokenIfConfirmedInvalid(
@@ -403,6 +404,13 @@ export function SessionLobbyView({
         </div>
       )}
 
+      <HandTablePanel
+        session={session}
+        viewer={viewer}
+        onSessionUpdate={setSession}
+        onError={setError}
+      />
+
       <LedgerPanel
         session={session}
         viewer={viewer}
@@ -417,20 +425,29 @@ export function SessionLobbyView({
         <div className="seat-list">
           {session.seats.map((seat) => {
             const isMine = viewer.seatNumber === seat.seatNumber;
+            const activeHand = session.handInProgress ? session.hand : null;
+            const isActing =
+              activeHand !== null &&
+              activeHand.status === "BETTING" &&
+              activeHand.actingSeatNumber === seat.seatNumber;
+            const inActiveHand =
+              activeHand !== null &&
+              activeHand.seats.some((s) => s.seatNumber === seat.seatNumber);
             const seatFunding = seat.occupant
               ? getAvailableFundingForSeat({
                   config: session.config,
                   chips: seat.occupant.chips,
                   totalBuyInChips: seat.occupant.totalBuyInChips,
+                  handInProgress: session.handInProgress,
                 })
               : null;
             const releaseBlocked =
               seat.occupant !== null &&
-              (seat.occupant.chips > 0 || seat.occupant.totalBuyInChips > 0);
+              (seat.occupant.chips > 0 || seat.occupant.totalBuyInChips > 0 || inActiveHand);
             return (
               <div
                 key={seat.seatNumber}
-                className={`seat-card ${isMine ? "seat-mine" : ""}`}
+                className={`seat-card ${isActing ? "seat-acting" : ""} ${isMine ? "seat-mine" : ""}`}
               >
                 <div className="seat-meta">
                   <div className="seat-title">
@@ -439,6 +456,16 @@ export function SessionLobbyView({
                       <>
                         <span>· {seat.occupant.displayName}</span>
                         {isMine && <span className="pill pill-live">You</span>}
+                        {activeHand?.buttonSeatNumber === seat.seatNumber && (
+                          <span className="pill">BTN</span>
+                        )}
+                        {activeHand?.sbSeatNumber === seat.seatNumber && (
+                          <span className="pill">SB</span>
+                        )}
+                        {activeHand?.bbSeatNumber === seat.seatNumber && (
+                          <span className="pill">BB</span>
+                        )}
+                        {isActing && <span className="pill pill-live">Acting</span>}
                         {seat.occupant.hasPendingRelink && (
                           <span className="pill pill-warn">Pending Re-link</span>
                         )}

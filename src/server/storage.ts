@@ -1,6 +1,13 @@
 import { timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import {
+  applyHandAction as applyHandActionEngine,
+  isHandInProgress,
+  resolveShowdown as resolveShowdownEngine,
+  startHand as startHandEngine,
+  type HandState,
+} from "../shared/handEngine.ts";
+import {
   normalizeSessionCode,
   validateFundingOperation,
   type BuyInRequestView,
@@ -57,6 +64,7 @@ export interface StoredSession {
   seats: StoredSeatRow[];
   pendingRequests: BuyInRequestView[];
   ledgerEntries: LedgerEntryView[];
+  hand: HandState | null;
 }
 
 export type ClaimSeatResult =
@@ -85,6 +93,10 @@ export type RejectBuyInRequestResult =
 
 export type RecordDirectLedgerResult =
   | { ok: true; ledgerEntry: LedgerEntryView; session: StoredSession }
+  | { ok: false; reason: "NOT_FOUND" | "VALIDATION" | "CONFLICT"; error: string };
+
+export type HandMutationResult =
+  | { ok: true; hand: HandState; session: StoredSession }
   | { ok: false; reason: "NOT_FOUND" | "VALIDATION" | "CONFLICT"; error: string };
 
 export interface SessionStorage {
@@ -125,6 +137,23 @@ export interface SessionStorage {
       amountChips: unknown;
     },
   ): RecordDirectLedgerResult;
+  startHand(code: string): HandMutationResult;
+  applyHandAction(
+    code: string,
+    params: {
+      seatNumber: number;
+      action: unknown;
+      amountChips?: unknown;
+      byHostProxy?: boolean;
+    },
+  ): HandMutationResult;
+  resolveShowdown(
+    code: string,
+    params: {
+      winnerSeatNumbers: unknown;
+      potId?: string | undefined;
+    },
+  ): HandMutationResult;
   close(): void;
 }
 
@@ -210,6 +239,18 @@ export function createSessionStorage(dbPath: string): SessionStorage {
     );
     CREATE INDEX IF NOT EXISTS idx_ledger_entries_session
       ON ledger_entries (session_code, created_at);
+    CREATE TABLE IF NOT EXISTS hands (
+      session_code TEXT NOT NULL REFERENCES sessions(code) ON DELETE CASCADE,
+      hand_number INTEGER NOT NULL,
+      status TEXT NOT NULL CHECK (status IN ('BETTING', 'SHOWDOWN', 'COMPLETE')),
+      button_seat_number INTEGER NOT NULL,
+      state_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (session_code, hand_number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_hands_session_latest
+      ON hands (session_code, hand_number DESC);
   `);
 
   const seatColumns = db.prepare("PRAGMA table_info(seats)").all() as Array<{ name: string }>;
@@ -271,6 +312,43 @@ export function createSessionStorage(dbPath: string): SessionStorage {
   const insertLedgerEntryStmt = db.prepare(
     "INSERT INTO ledger_entries (id, session_code, seat_number, player_id, display_name, kind, amount_chips, source, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   );
+  const selectLatestHandStmt = db.prepare(
+    "SELECT state_json FROM hands WHERE session_code = ? ORDER BY hand_number DESC LIMIT 1",
+  );
+  const selectActiveHandExistsStmt = db.prepare(
+    "SELECT 1 AS active FROM hands WHERE session_code = ? AND status != 'COMPLETE' LIMIT 1",
+  );
+  const insertHandStmt = db.prepare(
+    "INSERT INTO hands (session_code, hand_number, status, button_seat_number, state_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  );
+  const updateHandStmt = db.prepare(
+    "UPDATE hands SET status = ?, button_seat_number = ?, state_json = ?, updated_at = ? WHERE session_code = ? AND hand_number = ?",
+  );
+  const setSeatChipsStmt = db.prepare(
+    "UPDATE seats SET chips = ? WHERE session_code = ? AND seat_number = ? AND player_id = ?",
+  );
+
+  function mapSeatRowsToViews(rows: readonly StoredSeatRow[]): SeatView[] {
+    return rows.map((seat) => ({
+      seatNumber: seat.seat_number,
+      occupant:
+        seat.player_id !== null && seat.display_name !== null
+          ? {
+              playerId: seat.player_id,
+              displayName: seat.display_name,
+              chips: seat.chips,
+              totalBuyInChips: seat.total_buy_in_chips,
+              isConnected: false,
+              hasPendingRelink: seat.relink_code !== null,
+            }
+          : null,
+    }));
+  }
+
+  function getLatestHand(code: string): HandState | null {
+    const row = selectLatestHandStmt.get(code) as { state_json: string } | undefined;
+    return row ? (JSON.parse(row.state_json) as HandState) : null;
+  }
 
   function getSession(rawCode: string): StoredSession | null {
     const code = normalizeSessionCode(rawCode);
@@ -283,6 +361,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
     const seats = selectSeatsStmt.all(code) as unknown as StoredSeatRow[];
     const pendingRows = selectPendingRequestsStmt.all(code) as unknown as StoredBuyInRequestRow[];
     const ledgerRows = selectLedgerEntriesStmt.all(code) as unknown as StoredLedgerEntryRow[];
+    const hand = getLatestHand(code);
     return {
       code: row.code,
       hostToken: row.host_token,
@@ -290,6 +369,7 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       seats,
       pendingRequests: pendingRows.map(mapBuyInRequestRow),
       ledgerEntries: ledgerRows.map(mapLedgerEntryRow),
+      hand,
     };
   }
 
@@ -310,9 +390,62 @@ export function createSessionStorage(dbPath: string): SessionStorage {
     return row ? (JSON.parse(row.config_json) as SessionConfig) : null;
   }
 
-  function hasActiveHand(_code: string): boolean {
-    // Forward-compatibility hook for Hand lifecycle (#4+): no active Hand table exists yet.
-    return false;
+  function hasActiveHand(code: string): boolean {
+    return selectActiveHandExistsStmt.get(code) !== undefined;
+  }
+
+  function syncSeatsFromHand(code: string, hand: HandState): void {
+    for (const handSeat of hand.seats) {
+      const updated = setSeatChipsStmt.run(
+        handSeat.chips,
+        code,
+        handSeat.seatNumber,
+        handSeat.playerId,
+      );
+      if (updated.changes === 0) {
+        throw new Error(`Seat ${handSeat.seatNumber} missing or mismatched during Hand sync`);
+      }
+    }
+  }
+
+  function mutateLatestHand(
+    rawCode: string,
+    expectedStatus: HandState["status"],
+    missingStatusError: string,
+    transition: (hand: HandState, config: SessionConfig) => ReturnType<typeof applyHandActionEngine>,
+  ): HandMutationResult {
+    const code = normalizeSessionCode(rawCode);
+    return runInTransaction<HandMutationResult>(() => {
+      const config = getSessionMeta(code);
+      if (!config) {
+        return { ok: false, reason: "NOT_FOUND", error: "Session not found." };
+      }
+      const latestHand = getLatestHand(code);
+      if (!latestHand || latestHand.status !== expectedStatus) {
+        return { ok: false, reason: "CONFLICT", error: missingStatusError };
+      }
+
+      const next = transition(latestHand, config);
+      if (!next.ok) {
+        return next;
+      }
+
+      syncSeatsFromHand(code, next.value);
+      updateHandStmt.run(
+        next.value.status,
+        next.value.buttonSeatNumber,
+        JSON.stringify(next.value),
+        new Date().toISOString(),
+        code,
+        next.value.handNumber,
+      );
+
+      const updated = getSession(code);
+      if (!updated) {
+        throw new Error(`Session ${code} disappeared during Hand mutation`);
+      }
+      return { ok: true, hand: next.value, session: updated };
+    });
   }
 
   function applyApprovedFunding(params: {
@@ -462,6 +595,18 @@ export function createSessionStorage(dbPath: string): SessionStorage {
             ok: false,
             reason: "HAS_LEDGER_ACTIVITY",
             error: "Cannot release a Seat with Chips or recorded Buy-Ins on the ledger.",
+          };
+        }
+        const activeHand = getLatestHand(code);
+        if (
+          activeHand &&
+          isHandInProgress(activeHand) &&
+          activeHand.seats.some((s) => s.seatNumber === seatNumber)
+        ) {
+          return {
+            ok: false,
+            reason: "HAS_LEDGER_ACTIVITY",
+            error: "Cannot release a Seat participating in an active Hand.",
           };
         }
         releaseSeatStmt.run(code, seatNumber);
@@ -728,6 +873,66 @@ export function createSessionStorage(dbPath: string): SessionStorage {
       });
     },
 
+    startHand(rawCode): HandMutationResult {
+      const code = normalizeSessionCode(rawCode);
+      return runInTransaction<HandMutationResult>(() => {
+        const config = getSessionMeta(code);
+        if (!config) {
+          return { ok: false, reason: "NOT_FOUND", error: "Session not found." };
+        }
+        const latestHand = getLatestHand(code);
+        if (isHandInProgress(latestHand)) {
+          return { ok: false, reason: "CONFLICT", error: "A Hand is already in progress." };
+        }
+        const seatRows = selectSeatsStmt.all(code) as unknown as StoredSeatRow[];
+        const started = startHandEngine({
+          handNumber: latestHand ? latestHand.handNumber + 1 : 1,
+          config,
+          seats: mapSeatRowsToViews(seatRows),
+          previousButtonSeatNumber: latestHand ? latestHand.buttonSeatNumber : null,
+        });
+        if (!started.ok) {
+          return started;
+        }
+
+        const now = new Date().toISOString();
+        syncSeatsFromHand(code, started.value);
+        insertHandStmt.run(
+          code,
+          started.value.handNumber,
+          started.value.status,
+          started.value.buttonSeatNumber,
+          JSON.stringify(started.value),
+          now,
+          now,
+        );
+
+        const updated = getSession(code);
+        if (!updated) {
+          throw new Error(`Session ${code} disappeared during startHand`);
+        }
+        return { ok: true, hand: started.value, session: updated };
+      });
+    },
+
+    applyHandAction(rawCode, params): HandMutationResult {
+      return mutateLatestHand(
+        rawCode,
+        "BETTING",
+        "No active Hand is currently in a betting Street.",
+        (hand, config) => applyHandActionEngine(hand, config, params),
+      );
+    },
+
+    resolveShowdown(rawCode, params): HandMutationResult {
+      return mutateLatestHand(
+        rawCode,
+        "SHOWDOWN",
+        "No Hand is currently awaiting Showdown.",
+        (hand, config) => resolveShowdownEngine(hand, config, params),
+      );
+    },
+
     close(): void {
       db.close();
     },
@@ -791,5 +996,7 @@ export function toSessionSnapshot(
     seats,
     pendingRequests: stored.pendingRequests,
     ledgerEntries: stored.ledgerEntries,
+    hand: stored.hand,
+    handInProgress: isHandInProgress(stored.hand),
   };
 }

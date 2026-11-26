@@ -13,6 +13,11 @@ import {
   type RejectBuyInRequestResponse,
   type ReleaseSeatResponse,
   type RelinkSeatResponse,
+  type ResolveShowdownInput,
+  type ResolveShowdownResponse,
+  type StartHandResponse,
+  type SubmitHandActionInput,
+  type SubmitHandActionResponse,
 } from "../shared/session.ts";
 
 export interface StoredSessionTokens {
@@ -214,5 +219,48 @@ export const sessionApi = {
       },
     );
     return parseJsonOrThrow<RecordDirectLedgerResponse>(res);
+  },
+
+  async startHand(code: string, tokens: StoredSessionTokens): Promise<StartHandResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/hand/start`, {
+      method: "POST",
+      headers: authHeaders(tokens),
+    });
+    return parseJsonOrThrow<StartHandResponse>(res);
+  },
+
+  async submitHandAction(
+    code: string,
+    input: SubmitHandActionInput,
+    tokens: StoredSessionTokens,
+  ): Promise<SubmitHandActionResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/hand/actions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...authHeaders(tokens),
+      },
+      body: JSON.stringify(input),
+    });
+    return parseJsonOrThrow<SubmitHandActionResponse>(res);
+  },
+
+  async resolveShowdown(
+    code: string,
+    input: ResolveShowdownInput,
+    tokens: StoredSessionTokens,
+  ): Promise<ResolveShowdownResponse> {
+    const normalized = normalizeSessionCode(code);
+    const res = await fetch(`/api/sessions/${encodeURIComponent(normalized)}/hand/showdown`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...authHeaders(tokens),
+      },
+      body: JSON.stringify(input),
+    });
+    return parseJsonOrThrow<ResolveShowdownResponse>(res);
   },
 };

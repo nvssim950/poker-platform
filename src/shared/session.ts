@@ -1,3 +1,5 @@
+import type { HandState, PlayerActionType } from "./handEngine.ts";
+
 export interface SessionConfig {
   seatCount: number;
   smallBlind: number;
@@ -69,6 +71,8 @@ export interface SessionSnapshot {
   seats: SeatView[];
   pendingRequests: BuyInRequestView[];
   ledgerEntries: LedgerEntryView[];
+  hand: HandState | null;
+  handInProgress: boolean;
 }
 
 export interface ViewerIdentity {
@@ -150,6 +154,32 @@ export interface RecordDirectLedgerInput {
 
 export interface RecordDirectLedgerResponse {
   ledgerEntry: LedgerEntryView;
+  session: SessionSnapshot;
+}
+
+export interface StartHandResponse {
+  hand: HandState;
+  session: SessionSnapshot;
+}
+
+export interface SubmitHandActionInput {
+  seatNumber?: number | undefined;
+  action: PlayerActionType;
+  amountChips?: number | undefined;
+}
+
+export interface SubmitHandActionResponse {
+  hand: HandState;
+  session: SessionSnapshot;
+}
+
+export interface ResolveShowdownInput {
+  winnerSeatNumbers: number[];
+  potId?: string | undefined;
+}
+
+export interface ResolveShowdownResponse {
+  hand: HandState;
   session: SessionSnapshot;
 }
 

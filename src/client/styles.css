@@ -289,3 +289,64 @@ body {
 .inline-row input {
   flex: 1;
 }
+
+.deal-prompt-banner {
+  background: rgba(52, 211, 153, 0.12);
+  border: 1px solid rgba(52, 211, 153, 0.45);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  font-size: 0.9rem;
+}
+
+.turn-banner {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 9px 12px;
+  margin-bottom: 10px;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.turn-banner.turn-mine {
+  background: rgba(52, 211, 153, 0.16);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.seat-card.seat-acting {
+  border-color: var(--warn);
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.45);
+}
+
+.hand-stats-row {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.action-bar {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.wager-controls {
+  margin-bottom: 10px;
+}
+
+.action-buttons-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.showdown-option {
+  width: 100%;
+  color: var(--text);
+  cursor: pointer;
+}

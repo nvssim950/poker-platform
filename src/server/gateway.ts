@@ -617,6 +617,137 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         return;
       }
 
+      const startHandMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/hand\/start$/);
+      if (method === "POST" && startHandMatch) {
+        const ctx = requireHostForSession(req, res, startHandMatch[1] ?? "", "start a Hand");
+        if (!ctx) {
+          return;
+        }
+
+        const result = storage.startHand(ctx.code);
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
+        sendJson(res, 201, {
+          hand: result.hand,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const handActionMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/hand\/actions$/);
+      if (method === "POST" && handActionMatch) {
+        const code = normalizeSessionCode(handActionMatch[1] ?? "");
+        const stored = storage.getSession(code);
+        if (!stored) {
+          sendJson(res, 404, { error: "Session not found." });
+          return;
+        }
+
+        const hostToken = readHeaderToken(req, "x-host-token");
+        const seatToken = readHeaderToken(req, "x-seat-token");
+        const viewer = resolveSessionViewer(stored, hostToken, seatToken);
+        if (!viewer.isHost && viewer.seatNumber === null) {
+          sendJson(res, 403, { error: "Seat or Host token is required to submit a Hand Action." });
+          return;
+        }
+
+        const body = await readJsonBodyOr400(req, res);
+        if (body === undefined) {
+          return;
+        }
+        if (typeof body !== "object" || body === null || Array.isArray(body)) {
+          sendJson(res, 400, { error: "Action payload must be an object." });
+          return;
+        }
+        const payload = body as Record<string, unknown>;
+
+        let targetSeatNumber: number;
+        let byHostProxy = false;
+
+        if (viewer.isHost) {
+          if (payload.seatNumber !== undefined) {
+            if (
+              typeof payload.seatNumber !== "number" ||
+              !Number.isInteger(payload.seatNumber) ||
+              payload.seatNumber < 1 ||
+              payload.seatNumber > stored.config.seatCount
+            ) {
+              sendJson(res, 400, {
+                error: `Seat number must be between 1 and ${stored.config.seatCount}.`,
+              });
+              return;
+            }
+            targetSeatNumber = payload.seatNumber;
+            byHostProxy = viewer.seatNumber !== targetSeatNumber;
+          } else if (viewer.seatNumber !== null) {
+            targetSeatNumber = viewer.seatNumber;
+          } else {
+            sendJson(res, 400, { error: "Seat number is required for Host proxy Action." });
+            return;
+          }
+        } else {
+          if (payload.seatNumber !== undefined && payload.seatNumber !== viewer.seatNumber) {
+            sendJson(res, 403, { error: "Players can only submit Actions for their own Seat." });
+            return;
+          }
+          targetSeatNumber = viewer.seatNumber!;
+        }
+
+        const result = storage.applyHandAction(code, {
+          seatNumber: targetSeatNumber,
+          action: payload.action,
+          amountChips: payload.amountChips,
+          byHostProxy,
+        });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(code);
+        sendJson(res, 200, {
+          hand: result.hand,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
+      const showdownMatch = pathname.match(/^\/api\/sessions\/([A-Za-z0-9]+)\/hand\/showdown$/);
+      if (method === "POST" && showdownMatch) {
+        const ctx = requireHostForSession(req, res, showdownMatch[1] ?? "", "resolve Showdown");
+        if (!ctx) {
+          return;
+        }
+
+        const body = await readJsonBodyOr400(req, res);
+        if (body === undefined) {
+          return;
+        }
+        const payload = (typeof body === "object" && body !== null ? body : {}) as Record<
+          string,
+          unknown
+        >;
+        const result = storage.resolveShowdown(ctx.code, {
+          winnerSeatNumbers: payload.winnerSeatNumbers,
+          potId: typeof payload.potId === "string" ? payload.potId : undefined,
+        });
+        if (!result.ok) {
+          sendStorageFailure(res, result.reason, result.error);
+          return;
+        }
+
+        broadcastSession(ctx.code);
+        sendJson(res, 200, {
+          hand: result.hand,
+          session: toSessionSnapshot(result.session, getConnectedPlayers(result.session)),
+        });
+        return;
+      }
+
       if (method === "GET" && tryServeStatic(options.staticDir, pathname, res)) {
         return;
       }
