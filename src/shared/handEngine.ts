@@ -73,6 +73,7 @@ export interface HandState {
   actingSeatNumber: number | null;
   potChips: number;
   currentBet: number;
+  lastFullRaiseBet: number;
   lastFullRaiseIncrement: number;
   dealPrompt: string | null;
   seats: HandSeatState[];
@@ -287,28 +288,31 @@ function isStreetBettingClosed(hand: HandState): boolean {
   );
 }
 
-/**
- * Slices total Hand commitments into Main Pot and any Side Pots for Showdown resolution.
- */
-export function buildShowdownPots(seats: readonly HandSeatState[]): HandPot[] {
+function slicePotsByLevels(
+  seats: readonly HandSeatState[],
+  levels: readonly number[],
+  liveBettingMode: boolean,
+): HandPot[] {
   const nonFolded = seats.filter((s) => !s.hasFolded);
-  const distinctLevels = Array.from(
-    new Set(nonFolded.map((s) => s.totalCommittedChips).filter((amt) => amt > 0)),
-  ).sort((a, b) => a - b);
-
   const pots: HandPot[] = [];
   let prevLevel = 0;
 
-  for (const level of distinctLevels) {
+  for (const level of levels) {
     let sliceAmount = 0;
     for (const seat of seats) {
       if (seat.totalCommittedChips > prevLevel) {
         sliceAmount += Math.min(seat.totalCommittedChips, level) - prevLevel;
       }
     }
-    const eligibleSeatNumbers = nonFolded
-      .filter((s) => s.totalCommittedChips >= level)
-      .map((s) => s.seatNumber);
+    const eligibleSeatNumbers = liveBettingMode
+      ? pots.length === 0
+        ? nonFolded.map((s) => s.seatNumber)
+        : nonFolded
+            .filter((s) => s.totalCommittedChips > prevLevel)
+            .map((s) => s.seatNumber)
+      : nonFolded
+          .filter((s) => s.totalCommittedChips >= level)
+          .map((s) => s.seatNumber);
 
     if (sliceAmount > 0 && eligibleSeatNumbers.length > 0) {
       const potIndex = pots.length;
@@ -324,6 +328,56 @@ export function buildShowdownPots(seats: readonly HandSeatState[]): HandPot[] {
   }
 
   return pots;
+}
+
+/**
+ * Slices total Hand commitments into Main Pot and any Side Pots for Showdown resolution.
+ */
+export function buildShowdownPots(seats: readonly HandSeatState[]): HandPot[] {
+  const nonFolded = seats.filter((s) => !s.hasFolded);
+  const distinctLevels = Array.from(
+    new Set(nonFolded.map((s) => s.totalCommittedChips).filter((amt) => amt > 0)),
+  ).sort((a, b) => a - b);
+
+  return slicePotsByLevels(seats, distinctLevels, false);
+}
+
+/**
+ * Computes live Main Pot and Side Pots during betting, or returns authoritative Showdown/Complete Pots.
+ */
+export function getLivePots(hand: HandState): HandPot[] {
+  if (hand.status !== "BETTING") {
+    return hand.pots.map((p) => ({
+      ...p,
+      eligibleSeatNumbers: [...p.eligibleSeatNumbers],
+      winnerSeatNumbers: p.winnerSeatNumbers ? [...p.winnerSeatNumbers] : null,
+    }));
+  }
+
+  const nonFolded = hand.seats.filter((s) => !s.hasFolded);
+  if (nonFolded.length === 0) {
+    return [];
+  }
+
+  const maxCommitted = Math.max(0, ...nonFolded.map((s) => s.totalCommittedChips));
+  if (maxCommitted === 0) {
+    return [];
+  }
+
+  const allInCaps = Array.from(
+    new Set(
+      nonFolded
+        .filter((s) => s.isAllIn && s.totalCommittedChips > 0)
+        .map((s) => s.totalCommittedChips),
+    ),
+  ).sort((a, b) => a - b);
+
+  const levels = [...allInCaps];
+  if (levels.length === 0 || levels[levels.length - 1]! < maxCommitted) {
+    levels.push(maxCommitted);
+  }
+
+  return slicePotsByLevels(hand.seats, levels, true);
 }
 
 function returnUncalledStreetExcess(hand: HandState): UncalledReturnView | null {
@@ -390,6 +444,7 @@ function settleClosedStreet(hand: HandState, config: SessionConfig): void {
     hand.status = "COMPLETE";
     hand.actingSeatNumber = null;
     hand.currentBet = 0;
+    hand.lastFullRaiseBet = 0;
     hand.dealPrompt = null;
     hand.pots = [
       {
@@ -428,9 +483,55 @@ function settleClosedStreet(hand: HandState, config: SessionConfig): void {
     hand.status = "SHOWDOWN";
     hand.actingSeatNumber = null;
     hand.currentBet = 0;
+    hand.lastFullRaiseBet = 0;
     hand.lastFullRaiseIncrement = config.bigBlind;
     hand.dealPrompt = dealPrompt;
     hand.pots = buildShowdownPots(hand.seats);
+
+    const autoAwards: PotAwardView[] = [];
+    for (const pot of hand.pots) {
+      if (pot.eligibleSeatNumbers.length !== 1) {
+        continue;
+      }
+      const winnerSeatNumber = pot.eligibleSeatNumbers[0]!;
+      const winnerSeat = getSeat(hand, winnerSeatNumber);
+      if (!winnerSeat) {
+        continue;
+      }
+      winnerSeat.chips += pot.amountChips;
+      pot.winnerSeatNumbers = [winnerSeatNumber];
+      hand.potChips = Math.max(0, hand.potChips - pot.amountChips);
+      autoAwards.push({
+        potId: pot.id,
+        potLabel: pot.label,
+        seatNumber: winnerSeat.seatNumber,
+        playerId: winnerSeat.playerId,
+        displayName: winnerSeat.displayName,
+        amountChips: pot.amountChips,
+        oddChips: 0,
+      });
+    }
+
+    const totalPotChips = hand.pots.reduce((sum, p) => sum + p.amountChips, 0);
+    const remainingUnresolved = hand.pots.some((p) => p.winnerSeatNumbers === null);
+    if (!remainingUnresolved) {
+      hand.potChips = 0;
+      hand.status = "COMPLETE";
+      hand.dealPrompt = null;
+      hand.result = {
+        reason: "SHOWDOWN",
+        totalPotChips,
+        awards: autoAwards,
+        uncalledReturned: hand.lastUncalledReturned,
+      };
+    } else if (autoAwards.length > 0) {
+      hand.result = {
+        reason: "SHOWDOWN",
+        totalPotChips,
+        awards: autoAwards,
+        uncalledReturned: hand.lastUncalledReturned,
+      };
+    }
     return;
   }
 
@@ -438,6 +539,7 @@ function settleClosedStreet(hand: HandState, config: SessionConfig): void {
   hand.street = nextStreet;
   hand.status = "BETTING";
   hand.currentBet = 0;
+  hand.lastFullRaiseBet = 0;
   hand.lastFullRaiseIncrement = config.bigBlind;
   hand.dealPrompt = STREET_DEAL_PROMPTS[nextStreet];
   for (const seat of hand.seats) {
@@ -527,6 +629,7 @@ export function startHand(params: {
     ),
     potChips: 0,
     currentBet: Math.max(sbPosted, bbPosted),
+    lastFullRaiseBet: params.config.bigBlind,
     lastFullRaiseIncrement: params.config.bigBlind,
     dealPrompt: STREET_DEAL_PROMPTS.PREFLOP,
     seats: ordered.sort((a, b) => a.seatNumber - b.seatNumber),
@@ -580,7 +683,12 @@ export function getLegalActions(
     hasActiveOpponentWithChips &&
     maxStreetBet >= config.bigBlind;
 
-  const rawMinRaiseTo = Math.max(config.bigBlind, hand.currentBet + hand.lastFullRaiseIncrement);
+  const lastFullRaiseBet = hand.lastFullRaiseBet ?? hand.currentBet;
+  const rawMinRaiseTo = Math.max(
+    config.bigBlind,
+    lastFullRaiseBet + hand.lastFullRaiseIncrement,
+    hand.currentBet + hand.lastFullRaiseIncrement,
+  );
   const canRaise =
     hand.currentBet > 0 &&
     !seat.hasActedSinceFullRaise &&
@@ -785,6 +893,7 @@ export function applyHandAction(
     addedChips = applySeatWagerToStreetTarget(seat, target.value);
     recordedAmount = target.value;
     hand.currentBet = target.value;
+    hand.lastFullRaiseBet = target.value;
     hand.lastFullRaiseIncrement = target.value;
     reopenRaisingForOthers(hand, seat.seatNumber);
   } else if (action === "RAISE") {
@@ -820,14 +929,21 @@ export function applyHandAction(
     addedChips = applySeatWagerToStreetTarget(seat, target.value);
     recordedAmount = target.value;
     hand.currentBet = target.value;
+    hand.lastFullRaiseBet = target.value;
     hand.lastFullRaiseIncrement = target.value - oldCurrentBet;
     reopenRaisingForOthers(hand, seat.seatNumber);
   } else {
     if (!legal.canAllIn || legal.allInTo === null || legal.allInAddedChips === null) {
+      const blockedByShortAllIn =
+        hand.currentBet > 0 &&
+        seat.hasActedSinceFullRaise &&
+        seat.streetCommittedChips + seat.chips > hand.currentBet;
       return {
         ok: false,
         reason: "CONFLICT",
-        error: "All-In is not legal in the current table state.",
+        error: blockedByShortAllIn
+          ? "Raising is not reopened by a short All-In; Fold or Call."
+          : "All-In is not legal in the current table state.",
       };
     }
     if (
@@ -849,14 +965,20 @@ export function applyHandAction(
 
     if (target > oldCurrentBet) {
       const increment = target - oldCurrentBet;
+      const fullRaiseThreshold =
+        (hand.lastFullRaiseBet ?? oldCurrentBet) + hand.lastFullRaiseIncrement;
       const isFullOpenOrRaise =
         oldCurrentBet === 0
           ? target >= config.bigBlind
-          : increment >= hand.lastFullRaiseIncrement && target >= config.bigBlind;
+          : target >= fullRaiseThreshold && target >= config.bigBlind;
 
       hand.currentBet = target;
       if (isFullOpenOrRaise) {
-        hand.lastFullRaiseIncrement = oldCurrentBet === 0 ? target : increment;
+        hand.lastFullRaiseBet = target;
+        hand.lastFullRaiseIncrement =
+          oldCurrentBet === 0
+            ? target
+            : Math.max(hand.lastFullRaiseIncrement, increment);
         reopenRaisingForOthers(hand, seat.seatNumber);
       }
     }
@@ -1027,7 +1149,10 @@ export function resolveShowdown(
   targetPot.winnerSeatNumbers = orderedWinners;
   hand.potChips = Math.max(0, hand.potChips - targetPot.amountChips);
 
-  const allAwards = [...existingAwards, ...potAwards];
+  const potOrder = new Map(hand.pots.map((p, idx) => [p.id, idx]));
+  const allAwards = [...existingAwards, ...potAwards].sort(
+    (a, b) => (potOrder.get(a.potId) ?? 0) - (potOrder.get(b.potId) ?? 0),
+  );
   const remainingUnresolved = hand.pots.some((p) => p.winnerSeatNumbers === null);
 
   if (!remainingUnresolved) {
