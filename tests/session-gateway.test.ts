@@ -536,4 +536,10 @@ describe("Authoritative Session Gateway", () => {
     assert.equal(afterHostRemove.session.departedPlayers[1]?.totalIssuedChips, 200);
     assert.equal(afterHostRemove.session.departedPlayers[1]?.rebuyCount, 1);
   });
+
+  it("exposes GET /healthz for cloud health checks", async () => {
+    const res = await fetch(`${gateway.url}/healthz`);
+    assert.equal(res.status, 200);
+    assert.deepEqual(await res.json(), { ok: true });
+  });
 });

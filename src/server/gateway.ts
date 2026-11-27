@@ -743,6 +743,11 @@ export function createSessionGateway(options: SessionGatewayOptions): SessionGat
         return;
       }
 
+      if (method === "GET" && pathname === "/healthz") {
+        sendJson(res, 200, { ok: true });
+        return;
+      }
+
       if (method === "GET" && tryServeStatic(options.staticDir, pathname, res)) {
         return;
       }
