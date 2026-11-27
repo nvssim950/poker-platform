@@ -32,6 +32,7 @@ body {
 
 .brand-bar {
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: center;
   gap: 12px;
@@ -79,6 +80,8 @@ body {
 .field input,
 .field select {
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--border);
@@ -250,7 +253,8 @@ body {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  flex-shrink: 0;
+  max-width: 100%;
+  min-width: 0;
 }
 
 .ledger-stats {
