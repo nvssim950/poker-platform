@@ -1,18 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import type { ServerWsMessage } from "../shared/protocol.ts";
 import {
-  formatCashMinor,
-  formatChipsAsCash,
-  getAvailableFundingForSeat,
-  type RelinkSeatResponse,
   type SessionSnapshot,
   type ViewerIdentity,
 } from "../shared/session.ts";
-import { loadSessionTokens, saveHostToken, saveSeatToken, sessionApi } from "./api.ts";
-import { HandHistoryPanel } from "./HandHistoryPanel.tsx";
+import { loadSessionTokens, saveSeatToken, sessionApi } from "./api.ts";
 import { HandTablePanel } from "./HandTablePanel.tsx";
-import { LedgerPanel } from "./LedgerPanel.tsx";
-import { SettlementPanel } from "./SettlementPanel.tsx";
+import { LeaderboardPanel } from "./LeaderboardPanel.tsx";
 
 function clearSeatTokenIfConfirmedInvalid(
   code: string,
@@ -42,15 +36,9 @@ export function SessionLobbyView({
   const [wsState, setWsState] = useState<"connecting" | "live" | "reconnecting">("connecting");
   const [error, setError] = useState<string | null>(null);
   const [showInvite, setShowInvite] = useState(true);
-  const [showHostKey, setShowHostKey] = useState(false);
   const [copiedLabel, setCopiedLabel] = useState<string | null>(null);
   const [claimingSeat, setClaimingSeat] = useState<number | null>(null);
   const [displayName, setDisplayName] = useState("");
-  const [relinkInfo, setRelinkInfo] = useState<{
-    seatNumber: number;
-    data: RelinkSeatResponse;
-  } | null>(null);
-  const [selectedHostSeat, setSelectedHostSeat] = useState<number | null>(null);
 
   const socketRef = useRef<WebSocket | null>(null);
   const subscribedSeatTokenRef = useRef<string | null>(null);
@@ -76,28 +64,6 @@ export function SessionLobbyView({
     let cancelled = false;
     async function bootstrap(): Promise<void> {
       setError(null);
-      const url = new URL(window.location.href);
-      const hostParam = url.searchParams.get("host");
-      if (hostParam) {
-        saveHostToken(code, hostParam);
-        url.searchParams.delete("host");
-        window.history.replaceState({}, "", url.pathname + url.search);
-      }
-
-      const relinkCode = url.searchParams.get("relink");
-      if (relinkCode) {
-        try {
-          const redeemed = await sessionApi.redeemRelink(code, relinkCode);
-          saveSeatToken(code, redeemed.seatToken);
-          url.searchParams.delete("relink");
-          window.history.replaceState({}, "", url.pathname + url.search);
-          if (cancelled) return;
-        } catch (err) {
-          if (cancelled) return;
-          setError(err instanceof Error ? err.message : "Failed to redeem re-link code.");
-        }
-      }
-
       try {
         const tokens = loadSessionTokens(code);
         const data = await sessionApi.getSession(code, tokens);
@@ -203,22 +169,36 @@ export function SessionLobbyView({
     try {
       const res = await sessionApi.releaseSeat(code, seatNumber, loadSessionTokens(code));
       setSession(res.session);
-      if (relinkInfo?.seatNumber === seatNumber) {
-        setRelinkInfo(null);
+      if (viewer.seatNumber === seatNumber) {
+        saveSeatToken(code, null);
+        setViewer((prev) => ({ ...prev, seatNumber: null, playerId: null }));
+        syncSocketSubscription();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to release Seat.");
+      setError(err instanceof Error ? err.message : "Unable to remove Seat.");
     }
   }
 
-  async function handleRelinkSeat(seatNumber: number): Promise<void> {
+  async function handleLeaveSeat(seatNumber: number): Promise<void> {
     setError(null);
     try {
-      const res = await sessionApi.relinkSeat(code, seatNumber, loadSessionTokens(code));
+      const res = await sessionApi.leaveSeat(code, seatNumber, loadSessionTokens(code));
       setSession(res.session);
-      setRelinkInfo({ seatNumber, data: res });
+      saveSeatToken(code, null);
+      setViewer((prev) => ({ ...prev, seatNumber: null, playerId: null }));
+      syncSocketSubscription();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to re-link Seat.");
+      setError(err instanceof Error ? err.message : "Unable to leave Seat.");
+    }
+  }
+
+  async function handleRebuySeat(seatNumber: number): Promise<void> {
+    setError(null);
+    try {
+      const res = await sessionApi.rebuySeat(code, seatNumber, loadSessionTokens(code));
+      setSession(res.session);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to Rebuy.");
     }
   }
 
@@ -237,24 +217,6 @@ export function SessionLobbyView({
     }
   }
 
-  async function handleHostDirectCashOut(seatNumber: number): Promise<void> {
-    setError(null);
-    try {
-      const res = await sessionApi.directCashOut(code, seatNumber, loadSessionTokens(code));
-      setSession(res.session);
-      if (relinkInfo?.seatNumber === seatNumber) {
-        setRelinkInfo(null);
-      }
-      if (viewer.seatNumber === seatNumber) {
-        saveSeatToken(code, null);
-        setViewer((prev) => ({ ...prev, seatNumber: null, playerId: null }));
-        syncSocketSubscription();
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to cash out Seat.");
-    }
-  }
-
   if (!session) {
     return (
       <div className="card">
@@ -266,8 +228,14 @@ export function SessionLobbyView({
     );
   }
 
-  const hostToken = viewer.isHost ? loadSessionTokens(code).hostToken : null;
-  const hostRecoveryUrl = hostToken && shareUrl ? `${shareUrl}?host=${encodeURIComponent(hostToken)}` : null;
+  const leaderboardSection = (
+    <LeaderboardPanel
+      session={session}
+      viewer={viewer}
+      onSessionUpdate={setSession}
+      onError={setError}
+    />
+  );
 
   return (
     <>
@@ -284,7 +252,7 @@ export function SessionLobbyView({
               {viewer.seatNumber !== null && (
                 <span className="pill pill-live">Seat {viewer.seatNumber}</span>
               )}
-              {session.status === "SETTLED" && <span className="pill pill-warn">Settled</span>}
+              {session.status === "SETTLED" && <span className="pill pill-warn">Game Ended</span>}
             </div>
           </div>
           <div className="seat-actions">
@@ -303,29 +271,11 @@ export function SessionLobbyView({
 
         <div className="pill-row">
           <span className="pill">
+            Stack {session.config.startingStackChips} Chips
+          </span>
+          <span className="pill">
             Blinds {session.config.smallBlind}/{session.config.bigBlind}
           </span>
-          <span className="pill">Step {session.config.smallestChipStep}</span>
-          <span className="pill">
-            {session.config.exchangeRateChips} Chips ={" "}
-            {formatCashMinor(
-              session.config.exchangeRateCashMinor,
-              session.config.currencySymbol,
-            )}
-          </span>
-          {(session.config.minBuyInChips !== null || session.config.maxBuyInChips !== null) && (
-            <span className="pill">
-              Buy-In {session.config.minBuyInChips ?? "0"}–{session.config.maxBuyInChips ?? "∞"}
-            </span>
-          )}
-          {session.config.anteMode === "PER_SEAT" && session.config.anteChips > 0 && (
-            <span className="pill">Ante {session.config.anteChips}/Seat</span>
-          )}
-          {session.config.anteMode === "BIG_BLIND_ANTE" && session.config.anteChips > 0 && (
-            <span className="pill">BB Ante {session.config.anteChips}</span>
-          )}
-          {session.config.allowStraddle && <span className="pill">Straddle</span>}
-          {session.config.allowRunItTwice && <span className="pill">Run It Twice</span>}
         </div>
 
         {showInvite && (
@@ -340,78 +290,12 @@ export function SessionLobbyView({
               >
                 {copiedLabel === "share" ? "Copied Link!" : "Copy Invite Link"}
               </button>
-              {viewer.isHost && hostToken && (
-                <button
-                  type="button"
-                  className="btn btn-secondary btn-sm"
-                  onClick={() => setShowHostKey((v) => !v)}
-                >
-                  {showHostKey ? "Hide Host Key" : "Host Key"}
-                </button>
-              )}
             </div>
-            {viewer.isHost && showHostKey && hostToken && (
-              <div style={{ width: "100%", marginTop: "6px" }}>
-                <div className="mono-link" style={{ marginBottom: "6px" }}>
-                  Host token: {hostToken}
-                </div>
-                <div className="seat-actions" style={{ justifyContent: "center" }}>
-                  <button
-                    type="button"
-                    className="btn btn-secondary btn-sm"
-                    onClick={() => void copyText(hostToken, "hostToken")}
-                  >
-                    {copiedLabel === "hostToken" ? "Copied Token!" : "Copy Host Token"}
-                  </button>
-                  {hostRecoveryUrl && (
-                    <button
-                      type="button"
-                      className="btn btn-secondary btn-sm"
-                      onClick={() => void copyText(hostRecoveryUrl, "hostUrl")}
-                    >
-                      {copiedLabel === "hostUrl" ? "Copied Host Link!" : "Copy Host Link"}
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
           </div>
         )}
       </div>
 
       {error && <div className="error-banner">{error}</div>}
-
-      {relinkInfo && (
-        <div className="card">
-          <h3>Re-link Seat {relinkInfo.seatNumber}</h3>
-          <p className="seat-sub" style={{ marginTop: 0 }}>
-            Previous token revoked. Have the Player scan or open this one-time link:
-          </p>
-          <div className="qr-box">
-            <img
-              src={relinkInfo.data.qrCodeDataUrl}
-              alt={`Re-link QR code for Seat ${relinkInfo.seatNumber}`}
-            />
-            <div className="mono-link">{relinkInfo.data.relinkUrl}</div>
-            <div className="seat-actions">
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => void copyText(relinkInfo.data.relinkUrl, "relink")}
-              >
-                {copiedLabel === "relink" ? "Copied!" : "Copy Re-link URL"}
-              </button>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => setRelinkInfo(null)}
-              >
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {session.status === "ACTIVE" && claimingSeat !== null && (
         <div className="card">
@@ -448,37 +332,10 @@ export function SessionLobbyView({
         </div>
       )}
 
-      {session.status === "SETTLED" && (
-        <SettlementPanel
-          session={session}
-          viewer={viewer}
-          onSessionUpdate={setSession}
-          onError={setError}
-        />
-      )}
+      {session.status === "SETTLED" && leaderboardSection}
 
       {session.status === "ACTIVE" && (
         <HandTablePanel
-          session={session}
-          viewer={viewer}
-          onSessionUpdate={setSession}
-          onError={setError}
-        />
-      )}
-
-      <HandHistoryPanel session={session} />
-
-      <LedgerPanel
-        session={session}
-        viewer={viewer}
-        selectedHostSeat={selectedHostSeat}
-        onSelectHostSeat={setSelectedHostSeat}
-        onSessionUpdate={setSession}
-        onError={setError}
-      />
-
-      {session.status === "ACTIVE" && (
-        <SettlementPanel
           session={session}
           viewer={viewer}
           onSessionUpdate={setSession}
@@ -497,20 +354,10 @@ export function SessionLobbyView({
               activeHand !== null &&
               activeHand.status === "BETTING" &&
               activeHand.actingSeatNumber === seat.seatNumber;
-            const inActiveHand =
-              activeHand !== null &&
-              activeHand.seats.some((s) => s.seatNumber === seat.seatNumber);
-            const seatFunding = seat.occupant
-              ? getAvailableFundingForSeat({
-                  config: session.config,
-                  chips: seat.occupant.chips,
-                  totalBuyInChips: seat.occupant.totalBuyInChips,
-                  handInProgress: session.handInProgress,
-                })
-              : null;
-            const releaseBlocked =
-              seat.occupant !== null &&
-              (seat.occupant.chips > 0 || seat.occupant.totalBuyInChips > 0 || inActiveHand);
+            const activeHandSeat =
+              activeHand?.seats.find((s) => s.seatNumber === seat.seatNumber) ?? null;
+            const inActiveHand = activeHandSeat !== null;
+            const releaseBlocked = inActiveHand;
             return (
               <div
                 key={seat.seatNumber}
@@ -535,13 +382,9 @@ export function SessionLobbyView({
                         {activeHand?.bbSeatNumber === seat.seatNumber && (
                           <span className="pill">BB</span>
                         )}
-                        {activeHand?.straddleSeatNumber === seat.seatNumber && (
-                          <span className="pill">STR</span>
-                        )}
                         {isActing && <span className="pill pill-live">Acting</span>}
-                        {seat.occupant.hasPendingRelink && (
-                          <span className="pill pill-warn">Pending Re-link</span>
-                        )}
+                        {activeHandSeat?.hasFolded && <span className="pill">Folded</span>}
+                        {activeHandSeat?.isAllIn && <span className="pill pill-warn">All-In</span>}
                       </>
                     ) : (
                       <span className="seat-sub">· Open</span>
@@ -549,8 +392,11 @@ export function SessionLobbyView({
                   </div>
                   {seat.occupant && (
                     <div className="seat-sub">
-                      {seat.occupant.chips} Chips · Buy-In: {seat.occupant.totalBuyInChips} Chips (
-                      {formatChipsAsCash(seat.occupant.totalBuyInChips, session.config)}) ·{" "}
+                      {seat.occupant.chips} Chips
+                      {activeHandSeat && activeHandSeat.streetCommittedChips > 0
+                        ? ` · Street Bet: ${activeHandSeat.streetCommittedChips} Chips`
+                        : ""}
+                      {" · "}
                       {seat.occupant.isConnected ? "Connected" : "Offline"}
                     </div>
                   )}
@@ -565,6 +411,21 @@ export function SessionLobbyView({
                         onClick={() => setClaimingSeat(seat.seatNumber)}
                       >
                         Claim
+                      </button>
+                    )}
+                    {seat.occupant && (isMine || viewer.isHost) && seat.occupant.chips === 0 && (
+                      <button
+                        type="button"
+                        className="btn btn-primary btn-sm"
+                        disabled={session.handInProgress}
+                        title={
+                          session.handInProgress
+                            ? "Rebuy is only allowed between Hands."
+                            : `Rebuy ${session.config.startingStackChips} Chips`
+                        }
+                        onClick={() => void handleRebuySeat(seat.seatNumber)}
+                      >
+                        Rebuy
                       </button>
                     )}
                     {seat.occupant && (isMine || viewer.isHost) && (
@@ -586,58 +447,35 @@ export function SessionLobbyView({
                         {seat.occupant.isSittingOut ? "Return to Play" : "Sit Out"}
                       </button>
                     )}
+                    {seat.occupant && isMine && (
+                      <button
+                        type="button"
+                        className="btn btn-secondary btn-sm"
+                        disabled={session.handInProgress}
+                        title={
+                          session.handInProgress
+                            ? "Leave Seat is only allowed between Hands."
+                            : "Leave Seat"
+                        }
+                        onClick={() => void handleLeaveSeat(seat.seatNumber)}
+                      >
+                        Leave
+                      </button>
+                    )}
                     {seat.occupant && viewer.isHost && (
-                      <>
-                        {seatFunding && (
-                          <button
-                            type="button"
-                            className="btn btn-secondary btn-sm"
-                            disabled={seatFunding.disabledReason !== null}
-                            title={seatFunding.disabledReason ?? `Record ${seatFunding.label}`}
-                            onClick={() => {
-                              setSelectedHostSeat(seat.seatNumber);
-                              document
-                                .getElementById("host-ledger-entry")
-                                ?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                            }}
-                          >
-                            +{seatFunding.label}
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-sm"
-                          disabled={session.handInProgress}
-                          title={
-                            session.handInProgress
-                              ? "Cash-Out is only allowed between Hands."
-                              : "Cash out Seat and lock Chips"
-                          }
-                          onClick={() => void handleHostDirectCashOut(seat.seatNumber)}
-                        >
-                          Cash-Out
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-secondary btn-sm"
-                          onClick={() => void handleRelinkSeat(seat.seatNumber)}
-                        >
-                          Re-link
-                        </button>
-                        <button
-                          type="button"
-                          className="btn btn-danger btn-sm"
-                          disabled={releaseBlocked}
-                          title={
-                            releaseBlocked
-                              ? "Cannot release a Seat with Chips or recorded Buy-Ins"
-                              : "Release Seat"
-                          }
-                          onClick={() => void handleReleaseSeat(seat.seatNumber)}
-                        >
-                          Release
-                        </button>
-                      </>
+                      <button
+                        type="button"
+                        className="btn btn-danger btn-sm"
+                        disabled={releaseBlocked || session.handInProgress}
+                        title={
+                          releaseBlocked || session.handInProgress
+                            ? "Cannot remove a Seat while a Hand is in progress"
+                            : "Remove Player from Seat"
+                        }
+                        onClick={() => void handleReleaseSeat(seat.seatNumber)}
+                      >
+                        Remove
+                      </button>
                     )}
                   </div>
                 )}
@@ -646,6 +484,8 @@ export function SessionLobbyView({
           })}
         </div>
       </div>
+
+      {session.status === "ACTIVE" && leaderboardSection}
     </>
   );
 }

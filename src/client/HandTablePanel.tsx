@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import {
-  canRunItTwice,
   clockwiseLeftOfButtonOffset,
   computePotSplitAwards,
+  computeQuickWagerPresets,
   determineNextButtonSeat,
   getEligibleSeatsForNewHand,
   getLegalActions,
@@ -13,11 +13,7 @@ import {
 } from "../shared/handEngine.ts";
 import type { SessionSnapshot, ViewerIdentity } from "../shared/session.ts";
 import { loadSessionTokens, sessionApi } from "./api.ts";
-import {
-  formatActionSummary,
-  formatEligibleSeatList,
-  STREET_LABELS,
-} from "./handFormat.ts";
+import { formatEligibleSeatList, STREET_LABELS } from "./handFormat.ts";
 
 export function HandTablePanel({
   session,
@@ -33,8 +29,6 @@ export function HandTablePanel({
   const [submitting, setSubmitting] = useState(false);
   const [wagerText, setWagerText] = useState("");
   const [selectedWinnersByPot, setSelectedWinnersByPot] = useState<Record<string, number[]>>({});
-  const [showActionLog, setShowActionLog] = useState(false);
-  const [postStraddleOnStart, setPostStraddleOnStart] = useState(false);
 
   const hand = session.hand;
   const eligibleSeats = getEligibleSeatsForNewHand(session.seats);
@@ -45,28 +39,6 @@ export function HandTablePanel({
           hand?.buttonSeatNumber ?? null,
         )
       : null;
-
-  const nextUtgSeat =
-    session.config.allowStraddle && eligibleSeats.length >= 3 && nextButtonSeat !== null
-      ? [...eligibleSeats].sort((a, b) => {
-          const offA =
-            a.seatNumber === nextButtonSeat
-              ? 0
-              : clockwiseLeftOfButtonOffset(a.seatNumber, nextButtonSeat, session.config.seatCount);
-          const offB =
-            b.seatNumber === nextButtonSeat
-              ? 0
-              : clockwiseLeftOfButtonOffset(b.seatNumber, nextButtonSeat, session.config.seatCount);
-          return offA - offB;
-        })[3 % eligibleSeats.length] ?? null
-      : null;
-  const nextUtgChipsAfterAnte = nextUtgSeat
-    ? session.config.anteMode === "PER_SEAT"
-      ? Math.max(0, nextUtgSeat.chips - session.config.anteChips)
-      : nextUtgSeat.chips
-    : 0;
-  const nextUtgCanStraddle =
-    nextUtgSeat !== null && nextUtgChipsAfterAnte >= 2 * session.config.bigBlind;
 
   const actingSeat =
     hand && hand.actingSeatNumber !== null
@@ -80,6 +52,7 @@ export function HandTablePanel({
 
   const minWager = legal ? (legal.minBetTo ?? legal.minRaiseTo ?? null) : null;
   const maxWager = legal ? (legal.maxBetTo ?? legal.maxRaiseTo ?? null) : null;
+  const quickPresets = legal ? computeQuickWagerPresets(legal) : null;
 
   useEffect(() => {
     if (minWager !== null) {
@@ -105,33 +78,10 @@ export function HandTablePanel({
     onError(null);
     setSubmitting(true);
     try {
-      const useStraddle = postStraddleOnStart && nextUtgCanStraddle;
-      const res = await sessionApi.startHand(
-        session.code,
-        loadSessionTokens(session.code),
-        useStraddle ? { postStraddle: true } : undefined,
-      );
-      setPostStraddleOnStart(false);
+      const res = await sessionApi.startHand(session.code, loadSessionTokens(session.code));
       onSessionUpdate(res.session);
     } catch (err) {
       onError(err instanceof Error ? err.message : "Unable to start Hand.");
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  async function handleToggleRunItTwice(enabled: boolean): Promise<void> {
-    onError(null);
-    setSubmitting(true);
-    try {
-      const res = await sessionApi.setRunItTwice(
-        session.code,
-        { enabled },
-        loadSessionTokens(session.code),
-      );
-      onSessionUpdate(res.session);
-    } catch (err) {
-      onError(err instanceof Error ? err.message : "Unable to update Run It Twice.");
     } finally {
       setSubmitting(false);
     }
@@ -208,15 +158,12 @@ export function HandTablePanel({
     maxWager !== null &&
     Number.isInteger(parsedWager) &&
     parsedWager >= minWager &&
-    parsedWager <= maxWager &&
-    parsedWager % legal.smallestChipStep === 0;
+    parsedWager <= maxWager;
 
   let wagerError: string | null = null;
   if (minWager !== null && maxWager !== null && wagerText.trim().length > 0 && !wagerValid) {
     if (!Number.isInteger(parsedWager)) {
       wagerError = "Wager must be a whole number in Chips.";
-    } else if (legal && parsedWager % legal.smallestChipStep !== 0) {
-      wagerError = `Must be a multiple of smallest Chip step (${legal.smallestChipStep}).`;
     } else if (parsedWager < minWager) {
       wagerError = `Minimum is ${minWager} Chips.`;
     } else if (parsedWager > maxWager) {
@@ -253,8 +200,6 @@ export function HandTablePanel({
     !legal.canRaise &&
     actingSeat.chips > legal.toCall;
 
-  const ritEligible = hand !== null && canRunItTwice(hand, session.config);
-
   return (
     <>
       {!session.handInProgress && (
@@ -271,25 +216,6 @@ export function HandTablePanel({
               </div>
             </div>
           </div>
-
-          {viewer.isHost && session.config.allowStraddle && eligibleSeats.length >= 3 && nextUtgSeat && (
-            <div className="toggle-list">
-              <label className="toggle-row" htmlFor="start-hand-straddle">
-                <input
-                  id="start-hand-straddle"
-                  type="checkbox"
-                  checked={postStraddleOnStart && nextUtgCanStraddle}
-                  disabled={!nextUtgCanStraddle}
-                  onChange={(e) => setPostStraddleOnStart(e.target.checked)}
-                />
-                <span>
-                  Post UTG Straddle ({2 * session.config.bigBlind} Chips · Seat{" "}
-                  {nextUtgSeat.seatNumber} {nextUtgSeat.displayName})
-                  {!nextUtgCanStraddle ? " — insufficient Chips" : ""}
-                </span>
-              </label>
-            </div>
-          )}
 
           {viewer.isHost && (
             <button
@@ -325,7 +251,7 @@ export function HandTablePanel({
                 title={
                   session.canUndo
                     ? "Undo resolution and rewind to previous state"
-                    : "Undo locked after subsequent Buy-In, Rebuy, Top-Up, or Cash-Out"
+                    : "Undo locked after Rebuy or Seat departure"
                 }
                 onClick={() => void handleUndoHandStep()}
               >
@@ -358,11 +284,6 @@ export function HandTablePanel({
               ).
             </div>
           )}
-          {viewer.isHost && !session.canUndo && (
-            <div className="seat-sub" style={{ marginTop: "8px" }}>
-              Undo unavailable after post-Hand ledger or Cash-Out activity.
-            </div>
-          )}
         </div>
       )}
 
@@ -380,14 +301,6 @@ export function HandTablePanel({
                 <span className="pill">
                   SB {hand.sbSeatNumber} / BB {hand.bbSeatNumber}
                 </span>
-                {hand.bbAnteChips > 0 && <span className="pill">BB Ante {hand.bbAnteChips}</span>}
-                {session.config.anteMode === "PER_SEAT" && session.config.anteChips > 0 && (
-                  <span className="pill">Ante {session.config.anteChips}/Seat</span>
-                )}
-                {hand.straddleSeatNumber !== null && (
-                  <span className="pill">Straddle Seat {hand.straddleSeatNumber}</span>
-                )}
-                {hand.runItTwice && <span className="pill pill-live">Run It Twice</span>}
                 {hand.isHeadsUp && <span className="pill">Heads-Up</span>}
               </div>
             </div>
@@ -408,12 +321,6 @@ export function HandTablePanel({
               </button>
             )}
           </div>
-
-          {hand.dealPrompt && (
-            <div className="deal-prompt-banner">
-              <strong>Deal Prompt:</strong> {hand.dealPrompt}
-            </div>
-          )}
 
           {hand.status === "BETTING" && actingSeat && legal && (
             <>
@@ -436,9 +343,7 @@ export function HandTablePanel({
                   <span className="seat-sub">
                     {legal.canBet ? "Min Bet" : "Min Raise"}
                   </span>
-                  <strong>
-                    {minWager !== null ? `${minWager} Chips` : "—"}
-                  </strong>
+                  <strong>{minWager !== null ? `${minWager} Chips` : "—"}</strong>
                 </div>
               </div>
             </>
@@ -460,53 +365,6 @@ export function HandTablePanel({
             </div>
           )}
 
-          <div
-            className="seat-list"
-            style={{ marginBottom: canActNow || hand.status === "SHOWDOWN" ? "12px" : 0 }}
-          >
-            {hand.seats.map((seat) => {
-              const isActing =
-                hand.status === "BETTING" && hand.actingSeatNumber === seat.seatNumber;
-              return (
-                <div
-                  key={seat.seatNumber}
-                  className={`seat-card ${isActing ? "seat-acting" : ""} ${
-                    viewer.seatNumber === seat.seatNumber ? "seat-mine" : ""
-                  }`}
-                >
-                  <div className="seat-meta">
-                    <div className="seat-title">
-                      <span>
-                        Seat {seat.seatNumber} · {seat.displayName}
-                      </span>
-                      {seat.seatNumber === hand.buttonSeatNumber && (
-                        <span className="pill">BTN</span>
-                      )}
-                      {seat.seatNumber === hand.sbSeatNumber && <span className="pill">SB</span>}
-                      {seat.seatNumber === hand.bbSeatNumber && <span className="pill">BB</span>}
-                      {seat.seatNumber === hand.straddleSeatNumber && (
-                        <span className="pill">STR</span>
-                      )}
-                      {isActing && <span className="pill pill-live">Acting</span>}
-                      {seat.hasFolded && <span className="pill">Folded</span>}
-                      {seat.isAllIn && <span className="pill pill-warn">All-In</span>}
-                    </div>
-                    <div className="seat-sub">
-                      Stack: {seat.chips} Chips
-                      {seat.anteCommittedChips > 0 ? ` · Ante: ${seat.anteCommittedChips} Chips` : ""}
-                      {seat.streetCommittedChips > 0
-                        ? ` · Street Bet: ${seat.streetCommittedChips} Chips`
-                        : ""}
-                      {seat.totalCommittedChips > seat.streetCommittedChips
-                        ? ` · Total Committed: ${seat.totalCommittedChips} Chips`
-                        : ""}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-
           {canActNow && legal && actingSeat && (
             <div className="action-bar">
               <div className="seat-sub" style={{ marginBottom: "8px" }}>
@@ -521,51 +379,74 @@ export function HandTablePanel({
                 </div>
               )}
 
-              {(legal.canBet || legal.canRaise) && minWager !== null && maxWager !== null && (
-                <div className="wager-controls">
-                  {maxWager > minWager && (
+              {(legal.canBet || legal.canRaise) &&
+                minWager !== null &&
+                maxWager !== null &&
+                quickPresets !== null && (
+                  <div className="wager-controls">
+                    <div className="pill-row" style={{ marginBottom: "8px" }}>
+                      {(
+                        [
+                          { label: "Min", value: quickPresets.min },
+                          { label: "½ Pot", value: quickPresets.halfPot },
+                          { label: "Pot", value: quickPresets.pot },
+                          { label: "All-In", value: quickPresets.allIn },
+                        ] as const
+                      ).map((preset) => (
+                        <button
+                          key={preset.label}
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          disabled={submitting}
+                          onClick={() => setWagerText(String(preset.value))}
+                        >
+                          {preset.label}
+                        </button>
+                      ))}
+                    </div>
+                    {maxWager > minWager && (
+                      <div className="field">
+                        <label htmlFor="hand-wager-slider">
+                          {legal.canBet ? "Bet Amount" : "Raise To"} ({minWager}–{maxWager} Chips)
+                        </label>
+                        <input
+                          id="hand-wager-slider"
+                          className="chip-slider"
+                          type="range"
+                          min={minWager}
+                          max={maxWager}
+                          step={1}
+                          value={
+                            Number.isFinite(parsedWager)
+                              ? Math.min(maxWager, Math.max(minWager, parsedWager))
+                              : minWager
+                          }
+                          onChange={(e) => setWagerText(e.target.value)}
+                        />
+                      </div>
+                    )}
                     <div className="field">
-                      <label htmlFor="hand-wager-slider">
-                        {legal.canBet ? "Bet Amount" : "Raise To"} ({minWager}–{maxWager} Chips)
+                      <label htmlFor="hand-wager-input">
+                        {legal.canBet ? "Bet (Chips)" : "Raise To (Chips)"}
                       </label>
                       <input
-                        id="hand-wager-slider"
-                        className="chip-slider"
-                        type="range"
+                        id="hand-wager-input"
+                        type="number"
+                        inputMode="numeric"
                         min={minWager}
                         max={maxWager}
-                        step={legal.smallestChipStep}
-                        value={
-                          Number.isFinite(parsedWager)
-                            ? Math.min(maxWager, Math.max(minWager, parsedWager))
-                            : minWager
-                        }
+                        step={1}
+                        value={wagerText}
                         onChange={(e) => setWagerText(e.target.value)}
                       />
                     </div>
-                  )}
-                  <div className="field">
-                    <label htmlFor="hand-wager-input">
-                      {legal.canBet ? "Bet (Chips)" : "Raise To (Chips)"}
-                    </label>
-                    <input
-                      id="hand-wager-input"
-                      type="number"
-                      inputMode="numeric"
-                      min={minWager}
-                      max={maxWager}
-                      step={legal.smallestChipStep}
-                      value={wagerText}
-                      onChange={(e) => setWagerText(e.target.value)}
-                    />
+                    {wagerError && (
+                      <div className="seat-sub" style={{ color: "var(--warn)", marginBottom: "8px" }}>
+                        {wagerError}
+                      </div>
+                    )}
                   </div>
-                  {wagerError && (
-                    <div className="seat-sub" style={{ color: "var(--warn)", marginBottom: "8px" }}>
-                      {wagerError}
-                    </div>
-                  )}
-                </div>
-              )}
+                )}
 
               <div className="action-buttons-grid">
                 <button
@@ -633,53 +514,12 @@ export function HandTablePanel({
                     All-In ({legal.allInAddedChips})
                   </button>
                 )}
-
-                {legal.canStraddle && legal.straddleChips !== null && (
-                  <button
-                    type="button"
-                    className="btn btn-secondary"
-                    disabled={submitting}
-                    onClick={() => void handleAction("STRADDLE")}
-                  >
-                    Straddle ({legal.straddleChips})
-                  </button>
-                )}
               </div>
             </div>
           )}
 
           {hand.status === "SHOWDOWN" && hand.pots.length > 0 && (
             <div className="pot-list">
-              {(ritEligible || hand.runItTwice) && (
-                <div className="pot-card">
-                  <div
-                    className="seat-title"
-                    style={{ justifyContent: "space-between", width: "100%" }}
-                  >
-                    <span>Run It Twice</span>
-                    {viewer.isHost && ritEligible ? (
-                      <button
-                        type="button"
-                        className={`btn btn-sm ${hand.runItTwice ? "btn-primary" : "btn-secondary"}`}
-                        disabled={submitting}
-                        style={{ width: "auto" }}
-                        onClick={() => void handleToggleRunItTwice(!hand.runItTwice)}
-                      >
-                        {hand.runItTwice ? "Run It Twice: ON" : "Enable Run It Twice"}
-                      </button>
-                    ) : (
-                      <span className={`pill ${hand.runItTwice ? "pill-live" : ""}`}>
-                        {hand.runItTwice ? "Active" : "Single Run"}
-                      </span>
-                    )}
-                  </div>
-                  <div className="seat-sub">
-                    {hand.runItTwice
-                      ? "Contested Pots are split into Run 1 and Run 2 with independent winner selections."
-                      : "All-in Showdown eligible — Host can toggle Run It Twice to split contested Pots."}
-                  </div>
-                </div>
-              )}
               {hand.pots.map((pot) => {
                 const isResolved = pot.winnerSeatNumbers !== null;
                 const isAutoAwarded = isResolved && pot.eligibleSeatNumbers.length === 1;
@@ -743,7 +583,6 @@ export function HandTablePanel({
                         winnerSeatNumbers: selected,
                         buttonSeatNumber: hand.buttonSeatNumber,
                         seatCount: session.config.seatCount,
-                        smallestChipStep: session.config.smallestChipStep,
                       })
                     : null;
 
@@ -815,29 +654,6 @@ export function HandTablePanel({
                   </div>
                 );
               })}
-            </div>
-          )}
-
-          {hand.actionHistory.length > 0 && (
-            <div style={{ marginTop: "10px" }}>
-              <button
-                type="button"
-                className="btn btn-secondary btn-sm"
-                onClick={() => setShowActionLog((v) => !v)}
-              >
-                {showActionLog
-                  ? "Hide Hand Actions"
-                  : `Hand Actions (${hand.actionHistory.length})`}
-              </button>
-              {showActionLog && (
-                <div className="seat-list" style={{ marginTop: "8px" }}>
-                  {[...hand.actionHistory].reverse().map((record) => (
-                    <div key={record.index} className="seat-sub">
-                      {formatActionSummary(record)}
-                    </div>
-                  ))}
-                </div>
-              )}
             </div>
           )}
         </div>

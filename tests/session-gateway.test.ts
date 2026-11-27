@@ -18,7 +18,6 @@ interface SnapshotMessage {
         displayName: string;
         chips: number;
         isConnected: boolean;
-        hasPendingRelink: boolean;
       } | null;
     }>;
   };
@@ -43,12 +42,9 @@ async function createTestSession(
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       seatCount: 6,
+      startingStackChips: 1000,
       smallBlind: 10,
       bigBlind: 20,
-      smallestChipStep: 5,
-      currencySymbol: "$",
-      exchangeRateChips: 100,
-      exchangeRateCashMinor: 100,
       ...overrides,
     }),
   });
@@ -108,10 +104,9 @@ describe("Authoritative Session Gateway", () => {
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it("lets a Host create a Session (2-10 Seats) with stakes, exchange rate, share link, QR code, and Host token", async () => {
+  it("lets a Host create a Session (2-10 Seats) with Starting Stack, Blinds, share link, QR code, and Host token", async () => {
     const created = await createTestSession(gateway.url, {
-      minBuyInChips: 500,
-      maxBuyInChips: 2000,
+      startingStackChips: 1500,
     });
 
     assert.ok(created.hostToken.length >= 16);
@@ -122,18 +117,9 @@ describe("Authoritative Session Gateway", () => {
 
     assert.deepEqual(created.session.config, {
       seatCount: 6,
+      startingStackChips: 1500,
       smallBlind: 10,
       bigBlind: 20,
-      smallestChipStep: 5,
-      currencySymbol: "$",
-      exchangeRateChips: 100,
-      exchangeRateCashMinor: 100,
-      minBuyInChips: 500,
-      maxBuyInChips: 2000,
-      anteMode: "NONE",
-      anteChips: 0,
-      allowStraddle: false,
-      allowRunItTwice: false,
     });
     assert.deepEqual(
       created.session.seats.map((s) => s.seatNumber),
@@ -152,12 +138,9 @@ describe("Authoritative Session Gateway", () => {
       },
       body: JSON.stringify({
         seatCount: 4,
+        startingStackChips: 500,
         smallBlind: 5,
         bigBlind: 10,
-        smallestChipStep: 5,
-        currencySymbol: "$",
-        exchangeRateChips: 100,
-        exchangeRateCashMinor: 100,
       }),
     });
     assert.equal(res.status, 201);
@@ -171,12 +154,9 @@ describe("Authoritative Session Gateway", () => {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         seatCount: 1,
+        startingStackChips: 0,
         smallBlind: 15,
         bigBlind: 10,
-        smallestChipStep: 5,
-        currencySymbol: "$",
-        exchangeRateChips: 100,
-        exchangeRateCashMinor: 100,
       }),
     });
 
@@ -185,8 +165,27 @@ describe("Authoritative Session Gateway", () => {
     assert.ok(body.error.length > 0);
   });
 
-  it("lets Players join via Session code and claim open Seats without exposing tokens", async () => {
-    const created = await createTestSession(gateway.url, { seatCount: 4, currencySymbol: "€" });
+  it("applies default Session config values when fields are omitted", async () => {
+    const res = await fetch(`${gateway.url}/api/sessions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res.status, 201);
+    const created = (await res.json()) as {
+      session: { config: Record<string, unknown>; seats: Array<unknown> };
+    };
+    assert.deepEqual(created.session.config, {
+      seatCount: 8,
+      startingStackChips: 1000,
+      smallBlind: 10,
+      bigBlind: 20,
+    });
+    assert.equal(created.session.seats.length, 8);
+  });
+
+  it("lets Players join via Session code and claim open Seats with automatic Starting Stack", async () => {
+    const created = await createTestSession(gateway.url, { seatCount: 4, startingStackChips: 1200 });
     const code = created.session.code;
 
     const getBefore = await fetch(`${gateway.url}/api/sessions/${code}`);
@@ -213,7 +212,13 @@ describe("Authoritative Session Gateway", () => {
       session: {
         seats: Array<{
           seatNumber: number;
-          occupant: { playerId: string; displayName: string; chips: number; seatToken?: string } | null;
+          occupant: {
+            playerId: string;
+            displayName: string;
+            chips: number;
+            totalBuyInChips: number;
+            seatToken?: string;
+          } | null;
         }>;
       };
     };
@@ -224,8 +229,30 @@ describe("Authoritative Session Gateway", () => {
     assert.ok(seat2?.occupant);
     assert.equal(seat2.occupant.playerId, claimed.playerId);
     assert.equal(seat2.occupant.displayName, "Alice");
-    assert.equal(seat2.occupant.chips, 0);
+    assert.equal(seat2.occupant.chips, 1200);
+    assert.equal(seat2.occupant.totalBuyInChips, 1200);
     assert.equal(seat2.occupant.seatToken, undefined);
+
+    const buyInRes = await fetch(`${gateway.url}/api/sessions/${code}/buy-in-requests`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-seat-token": claimed.seatToken },
+      body: JSON.stringify({ kind: "BUY_IN", amountChips: 500 }),
+    });
+    assert.equal(buyInRes.status, 404);
+
+    const directLedgerRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/2/ledger`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-host-token": created.hostToken },
+      body: JSON.stringify({ kind: "BUY_IN", amountChips: 500 }),
+    });
+    assert.equal(directLedgerRes.status, 404);
+
+    const cashOutReqRes = await fetch(`${gateway.url}/api/sessions/${code}/cash-out-requests`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-seat-token": claimed.seatToken },
+      body: JSON.stringify({}),
+    });
+    assert.equal(cashOutReqRes.status, 404);
 
     const conflictRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/claim`, {
       method: "POST",
@@ -332,15 +359,20 @@ describe("Authoritative Session Gateway", () => {
     restartedCarolWs.ws.close();
   });
 
-  it("lets the Host relink or release a Seat while blocking unauthorized Players", async () => {
-    const created = await createTestSession(gateway.url, { seatCount: 4 });
+  it("supports instant self-service Rebuy at 0 Chips, Leave Seat, Host Release with departed snapshot, and removes Relink", async () => {
+    const created = await createTestSession(gateway.url, {
+      seatCount: 4,
+      startingStackChips: 100,
+      smallBlind: 10,
+      bigBlind: 20,
+    });
     const code = created.session.code;
 
     const alice = (await (
       await fetch(`${gateway.url}/api/sessions/${code}/seats/claim`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ seatNumber: 2, displayName: "Alice" }),
+        body: JSON.stringify({ seatNumber: 1, displayName: "Alice" }),
       })
     ).json()) as { seatToken: string; playerId: string };
 
@@ -348,112 +380,160 @@ describe("Authoritative Session Gateway", () => {
       await fetch(`${gateway.url}/api/sessions/${code}/seats/claim`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ seatNumber: 4, displayName: "Bob" }),
+        body: JSON.stringify({ seatNumber: 2, displayName: "Bob" }),
       })
     ).json()) as { seatToken: string; playerId: string };
 
-    const unauthRelease = await fetch(`${gateway.url}/api/sessions/${code}/seats/2/release`, {
+    // Relink endpoints are removed (404)
+    const relinkRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/1/relink`, {
+      method: "POST",
+      headers: { "x-host-token": created.hostToken },
+    });
+    assert.equal(relinkRes.status, 404);
+
+    // Rebuy rejected when chips > 0 (409)
+    const earlyRebuy = await fetch(`${gateway.url}/api/sessions/${code}/seats/1/rebuy`, {
+      method: "POST",
+      headers: { "x-seat-token": alice.seatToken },
+    });
+    assert.equal(earlyRebuy.status, 409);
+
+    // Play a Hand so Alice busts to 0 Chips and Bob goes to 200 Chips
+    const startRes = await fetch(`${gateway.url}/api/sessions/${code}/hand/start`, {
+      method: "POST",
+      headers: { "x-host-token": created.hostToken },
+    });
+    const started = (await startRes.json()) as { hand: Record<string, unknown> };
+    assert.equal("dealPrompt" in started.hand, false);
+    assert.equal("straddleSeatNumber" in started.hand, false);
+    assert.equal("runItTwice" in started.hand, false);
+
+    // Removed house-rule Hand endpoints return 404
+    const straddleRes = await fetch(`${gateway.url}/api/sessions/${code}/hand/straddle`, {
+      method: "POST",
+      headers: { "x-seat-token": alice.seatToken },
+    });
+    assert.equal(straddleRes.status, 404);
+
+    const ritRes = await fetch(`${gateway.url}/api/sessions/${code}/hand/run-it-twice`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-host-token": created.hostToken },
+      body: JSON.stringify({ enabled: true }),
+    });
+    assert.equal(ritRes.status, 404);
+
+    // Leave/Release/Rebuy blocked during active Hand (409)
+    const midHandLeave = await fetch(`${gateway.url}/api/sessions/${code}/seats/1/leave`, {
+      method: "POST",
+      headers: { "x-seat-token": alice.seatToken },
+    });
+    assert.equal(midHandLeave.status, 409);
+
+    await fetch(`${gateway.url}/api/sessions/${code}/hand/actions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-seat-token": alice.seatToken },
+      body: JSON.stringify({ action: "ALL_IN" }),
+    });
+    await fetch(`${gateway.url}/api/sessions/${code}/hand/actions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-seat-token": bob.seatToken },
+      body: JSON.stringify({ action: "CALL" }),
+    });
+    await fetch(`${gateway.url}/api/sessions/${code}/hand/showdown`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-host-token": created.hostToken },
+      body: JSON.stringify({ winnerSeatNumbers: [2] }),
+    });
+
+    // Bob cannot rebuy for Alice (403)
+    const unauthRebuy = await fetch(`${gateway.url}/api/sessions/${code}/seats/1/rebuy`, {
       method: "POST",
       headers: { "x-seat-token": bob.seatToken },
     });
-    assert.equal(unauthRelease.status, 403);
+    assert.equal(unauthRebuy.status, 403);
 
-    const unauthRelink = await fetch(`${gateway.url}/api/sessions/${code}/seats/2/relink`, {
+    // Alice self-rebuy succeeds without Host approval!
+    const aliceRebuyRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/1/rebuy`, {
       method: "POST",
-      headers: { "x-seat-token": bob.seatToken, "x-host-token": "wrong-token" },
-    });
-    assert.equal(unauthRelink.status, 403);
-
-    const aliceConn = await connectSubscribedWs(gateway.url, { code, seatToken: alice.seatToken });
-    assert.equal(aliceConn.messages[0]?.viewer.seatNumber, 2);
-
-    const relinkRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/2/relink`, {
-      method: "POST",
-      headers: { "x-host-token": created.hostToken },
-    });
-    assert.equal(relinkRes.status, 200);
-    const relink = (await relinkRes.json()) as {
-      relinkCode: string;
-      relinkPath: string;
-      relinkUrl: string;
-      qrCodeDataUrl: string;
-      session: {
-        seats: Array<{
-          seatNumber: number;
-          occupant: { displayName: string; hasPendingRelink: boolean } | null;
-        }>;
-      };
-    };
-    assert.ok(relink.relinkCode.length >= 12);
-    assert.equal(relink.relinkPath, `/s/${code}?relink=${relink.relinkCode}`);
-    assert.equal(relink.relinkUrl, `${gateway.url}/s/${code}?relink=${relink.relinkCode}`);
-    assert.match(relink.qrCodeDataUrl, /^data:image\/png;base64,/);
-    assert.equal(relink.session.seats.find((s) => s.seatNumber === 2)?.occupant?.hasPendingRelink, true);
-
-    await waitForCondition(() => aliceConn.messages.some((m) => m.viewer.seatNumber === null));
-    aliceConn.ws.close();
-
-    const oldTokenCheck = await fetch(`${gateway.url}/api/sessions/${code}`, {
       headers: { "x-seat-token": alice.seatToken },
     });
-    const oldTokenJson = (await oldTokenCheck.json()) as {
-      viewer: { isHost: boolean; seatNumber: number | null; playerId: string | null };
-    };
-    assert.deepEqual(oldTokenJson.viewer, { isHost: false, seatNumber: null, playerId: null });
-
-    const redeemRes = await fetch(`${gateway.url}/api/sessions/${code}/relink/redeem`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ relinkCode: relink.relinkCode }),
-    });
-    assert.equal(redeemRes.status, 200);
-    const redeemed = (await redeemRes.json()) as {
-      seatToken: string;
-      playerId: string;
-      seatNumber: number;
+    assert.equal(aliceRebuyRes.status, 200);
+    const afterRebuy = (await aliceRebuyRes.json()) as {
       session: {
+        canUndo: boolean;
         seats: Array<{
           seatNumber: number;
-          occupant: { displayName: string; hasPendingRelink: boolean } | null;
+          occupant: { chips: number; totalBuyInChips: number; rebuyCount: number } | null;
         }>;
       };
     };
-    assert.notEqual(redeemed.seatToken, alice.seatToken);
-    assert.equal(redeemed.playerId, alice.playerId);
-    assert.equal(redeemed.seatNumber, 2);
-    assert.equal(redeemed.session.seats.find((s) => s.seatNumber === 2)?.occupant?.displayName, "Alice");
-    assert.equal(redeemed.session.seats.find((s) => s.seatNumber === 2)?.occupant?.hasPendingRelink, false);
+    assert.equal(afterRebuy.session.canUndo, false);
+    const aliceOcc = afterRebuy.session.seats.find((s) => s.seatNumber === 1)?.occupant;
+    assert.equal(aliceOcc?.chips, 100);
+    assert.equal(aliceOcc?.totalBuyInChips, 200);
+    assert.equal(aliceOcc?.rebuyCount, 1);
 
-    const reuseRes = await fetch(`${gateway.url}/api/sessions/${code}/relink/redeem`, {
+    // Bob cannot leave Alice's seat (403)
+    const unauthLeave = await fetch(`${gateway.url}/api/sessions/${code}/seats/1/leave`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ relinkCode: relink.relinkCode }),
+      headers: { "x-seat-token": bob.seatToken },
     });
-    assert.equal(reuseRes.status, 404);
+    assert.equal(unauthLeave.status, 403);
 
-    const releaseRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/2/release`, {
+    // Bob leaves Seat 2 voluntarily -> Seat 2 opens, token revoked, departed snapshot preserved
+    const bobLeaveRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/2/leave`, {
+      method: "POST",
+      headers: { "x-seat-token": bob.seatToken },
+    });
+    assert.equal(bobLeaveRes.status, 200);
+    const afterBobLeave = (await bobLeaveRes.json()) as {
+      session: {
+        seats: Array<{ seatNumber: number; occupant: unknown }>;
+        departedPlayers: Array<{
+          seatNumber: number;
+          displayName: string;
+          endingChips: number;
+          totalIssuedChips: number;
+          rebuyCount: number;
+        }>;
+      };
+    };
+    assert.equal(afterBobLeave.session.seats.find((s) => s.seatNumber === 2)?.occupant, null);
+    assert.equal(afterBobLeave.session.departedPlayers.length, 1);
+    assert.equal(afterBobLeave.session.departedPlayers[0]?.displayName, "Bob");
+    assert.equal(afterBobLeave.session.departedPlayers[0]?.endingChips, 200);
+    assert.equal(afterBobLeave.session.departedPlayers[0]?.totalIssuedChips, 100);
+    assert.equal(afterBobLeave.session.departedPlayers[0]?.rebuyCount, 0);
+
+    // Bob's old token is now invalid
+    const bobView = await fetch(`${gateway.url}/api/sessions/${code}`, {
+      headers: { "x-seat-token": bob.seatToken },
+    });
+    const bobViewer = (await bobView.json()) as { viewer: { seatNumber: number | null } };
+    assert.equal(bobViewer.viewer.seatNumber, null);
+
+    // Host removes (Releases) Alice from Seat 1 -> snapshot preserved too
+    const hostRemoveRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/1/release`, {
       method: "POST",
       headers: { "x-host-token": created.hostToken },
     });
-    assert.equal(releaseRes.status, 200);
-    const released = (await releaseRes.json()) as {
-      session: { seats: Array<{ seatNumber: number; occupant: unknown }> };
+    assert.equal(hostRemoveRes.status, 200);
+    const afterHostRemove = (await hostRemoveRes.json()) as {
+      session: {
+        seats: Array<{ seatNumber: number; occupant: unknown }>;
+        departedPlayers: Array<{
+          seatNumber: number;
+          displayName: string;
+          endingChips: number;
+          totalIssuedChips: number;
+          rebuyCount: number;
+        }>;
+      };
     };
-    assert.equal(released.session.seats.find((s) => s.seatNumber === 2)?.occupant, null);
-
-    const afterReleaseView = await fetch(`${gateway.url}/api/sessions/${code}`, {
-      headers: { "x-seat-token": redeemed.seatToken },
-    });
-    const afterReleaseJson = (await afterReleaseView.json()) as {
-      viewer: { seatNumber: number | null };
-    };
-    assert.equal(afterReleaseJson.viewer.seatNumber, null);
-
-    const danClaimRes = await fetch(`${gateway.url}/api/sessions/${code}/seats/claim`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ seatNumber: 2, displayName: "Dan" }),
-    });
-    assert.equal(danClaimRes.status, 200);
+    assert.equal(afterHostRemove.session.seats.find((s) => s.seatNumber === 1)?.occupant, null);
+    assert.equal(afterHostRemove.session.departedPlayers.length, 2);
+    assert.equal(afterHostRemove.session.departedPlayers[1]?.displayName, "Alice");
+    assert.equal(afterHostRemove.session.departedPlayers[1]?.totalIssuedChips, 200);
+    assert.equal(afterHostRemove.session.departedPlayers[1]?.rebuyCount, 1);
   });
 });

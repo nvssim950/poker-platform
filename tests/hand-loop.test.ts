@@ -17,26 +17,25 @@ interface SnapshotMessage {
 async function createFundedSession(
   gatewayUrl: string,
   configOverrides: Record<string, unknown> = {},
-  players: Array<{ seatNumber: number; displayName: string; chips: number }> = [],
+  players: Array<{ seatNumber: number; displayName: string; chips?: number }> = [],
 ): Promise<{
   code: string;
   hostToken: string;
   seats: Record<number, { seatToken: string; playerId: string; seatNumber: number }>;
   session: SessionSnapshot;
 }> {
+  const startingStackChips =
+    typeof configOverrides.startingStackChips === "number"
+      ? configOverrides.startingStackChips
+      : 1000;
   const createRes = await fetch(`${gatewayUrl}/api/sessions`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       seatCount: 6,
+      startingStackChips,
       smallBlind: 10,
       bigBlind: 20,
-      smallestChipStep: 5,
-      currencySymbol: "$",
-      exchangeRateChips: 100,
-      exchangeRateCashMinor: 100,
-      minBuyInChips: 100,
-      maxBuyInChips: 5000,
       ...configOverrides,
     }),
   });
@@ -69,20 +68,6 @@ async function createFundedSession(
       seatNumber: claimed.seatNumber,
     };
     latestSession = claimed.session;
-
-    if (p.chips > 0) {
-      const fundRes = await fetch(`${gatewayUrl}/api/sessions/${code}/seats/${p.seatNumber}/ledger`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-host-token": created.hostToken,
-        },
-        body: JSON.stringify({ kind: "BUY_IN", amountChips: p.chips }),
-      });
-      assert.equal(fundRes.status, 201);
-      const funded = (await fundRes.json()) as { session: SessionSnapshot };
-      latestSession = funded.session;
-    }
   }
 
   return { code, hostToken: created.hostToken, seats, session: latestSession };
@@ -185,13 +170,9 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
   it("enforces Start Hand readiness, Heads-Up Button=SB and acting order, street auto-advancement, and Moving Button rotation", async () => {
     const setup = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 10, bigBlind: 20, smallestChipStep: 5 },
-      [
-        { seatNumber: 2, displayName: "Alice", chips: 1000 },
-        { seatNumber: 5, displayName: "Bob", chips: 0 },
-      ],
+      { seatCount: 6, startingStackChips: 1000, smallBlind: 10, bigBlind: 20 },
+      [{ seatNumber: 2, displayName: "Alice" }],
     );
-    const seat5 = setup.seats[5]!;
     const seat2 = setup.seats[2]!;
 
     assert.equal(setup.session.hand, null);
@@ -204,20 +185,18 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     });
     assert.equal(unauthStart.status, 403);
 
-    // Cannot start a Hand with only 1 funded Seat (Bob has 0 Chips)
+    // Cannot start a Hand with only 1 funded Seat
     const oneFundedStart = await startHand(gateway.url, setup.code, setup.hostToken);
     assert.equal(oneFundedStart.status, 409);
 
-    // Fund Bob with 1000 Chips so 2 funded Seats are ready
-    const fundBob = await fetch(`${gateway.url}/api/sessions/${setup.code}/seats/5/ledger`, {
+    // Bob claims Seat 5 and is auto-funded with 1000 Chips so 2 funded Seats are ready
+    const claimBob = await fetch(`${gateway.url}/api/sessions/${setup.code}/seats/claim`, {
       method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-host-token": setup.hostToken,
-      },
-      body: JSON.stringify({ kind: "BUY_IN", amountChips: 1000 }),
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ seatNumber: 5, displayName: "Bob" }),
     });
-    assert.equal(fundBob.status, 201);
+    assert.equal(claimBob.status, 200);
+    const seat5 = (await claimBob.json()) as { seatToken: string; playerId: string; seatNumber: number };
 
     const aliceWs = await connectSubscribedWs(gateway.url, {
       code: setup.code,
@@ -243,24 +222,12 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     assert.equal(start1.hand.bbSeatNumber, 5);
     // In Heads-Up Preflop, Button/SB acts first
     assert.equal(start1.hand.actingSeatNumber, 2);
-    assert.ok(start1.hand.dealPrompt && start1.hand.dealPrompt.length > 0);
     assert.equal(getSeatChips(start1.session, 2), 990);
     assert.equal(getSeatChips(start1.session, 5), 980);
 
     // Cannot start another Hand while Hand 1 is in progress
     const duplicateStart = await startHand(gateway.url, setup.code, setup.hostToken);
     assert.equal(duplicateStart.status, 409);
-
-    // Top-Up is blocked while a Hand is in progress
-    const midHandTopUp = await fetch(`${gateway.url}/api/sessions/${setup.code}/buy-in-requests`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-seat-token": seat2.seatToken,
-      },
-      body: JSON.stringify({ kind: "TOP_UP", amountChips: 100 }),
-    });
-    assert.equal(midHandTopUp.status, 409);
 
     // Live WebSocket sync delivers active Hand state
     await waitForCondition(() =>
@@ -290,7 +257,6 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     assert.equal(flopState.hand.street, "FLOP");
     assert.equal(flopState.hand.potChips, 40);
     assert.equal(flopState.hand.actingSeatNumber, 5); // BB (left of Button) acts first postflop
-    assert.match(flopState.hand.dealPrompt ?? "", /Flop/i);
 
     // Flop: Check -> Check -> advances to TURN
     assert.equal(
@@ -308,7 +274,6 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     const turnState = (await turnRes.json()) as { hand: HandState };
     assert.equal(turnState.hand.street, "TURN");
     assert.equal(turnState.hand.actingSeatNumber, 5);
-    assert.match(turnState.hand.dealPrompt ?? "", /Turn/i);
 
     // Turn: Check -> Check -> advances to RIVER
     assert.equal(
@@ -326,7 +291,6 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     const riverState = (await riverRes.json()) as { hand: HandState };
     assert.equal(riverState.hand.street, "RIVER");
     assert.equal(riverState.hand.actingSeatNumber, 5);
-    assert.match(riverState.hand.dealPrompt ?? "", /River/i);
 
     // River: Check -> Check -> advances to SHOWDOWN
     assert.equal(
@@ -375,7 +339,7 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
   it("enforces multi-way turn order, min-bet/min-raise/step validation, and short All-In non-reopening rules", async () => {
     const setup = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 10, bigBlind: 20, smallestChipStep: 5 },
+      { seatCount: 6, smallBlind: 10, bigBlind: 20 },
       [
         { seatNumber: 1, displayName: "Alice", chips: 1000 },
         { seatNumber: 2, displayName: "Bob", chips: 1000 },
@@ -422,14 +386,14 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     );
     assert.equal(badCheck.status, 409);
 
-    // Off-step raise rejected (400)
-    const offStepRaise = await submitAction(
+    // Fractional raise rejected (400)
+    const fractionalRaise = await submitAction(
       gateway.url,
       setup.code,
       { "x-seat-token": setup.seats[6]!.seatToken },
-      { action: "RAISE", amountChips: 42 },
+      { action: "RAISE", amountChips: 42.5 },
     );
-    assert.equal(offStepRaise.status, 400);
+    assert.equal(fractionalRaise.status, 400);
 
     // Below min-raise rejected (400): currentBet=20, minRaiseTo=40
     const belowMinRaise = await submitAction(
@@ -537,10 +501,10 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
   it("supports Host proxy Actions, safe mid-Hand Seat claiming, and new Players entering next Hand without dead-blind penalties", async () => {
     const setup = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 10, bigBlind: 20, smallestChipStep: 5 },
+      { seatCount: 6, startingStackChips: 500, smallBlind: 10, bigBlind: 20 },
       [
-        { seatNumber: 1, displayName: "Alice", chips: 500 },
-        { seatNumber: 4, displayName: "Bob", chips: 500 },
+        { seatNumber: 1, displayName: "Alice" },
+        { seatNumber: 4, displayName: "Bob" },
       ],
     );
 
@@ -550,7 +514,7 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     assert.equal(start1.hand.buttonSeatNumber, 1);
     assert.equal(start1.hand.actingSeatNumber, 1);
 
-    // New Player Carol claims open Seat 2 mid-Hand and gets initial Buy-In without entering Hand 1
+    // New Player Carol claims open Seat 2 mid-Hand (auto-funded 500 Chips) without entering Hand 1
     const carolClaimRes = await fetch(`${gateway.url}/api/sessions/${setup.code}/seats/claim`, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -560,13 +524,6 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     const carolClaim = (await carolClaimRes.json()) as { session: SessionSnapshot };
     assert.equal(carolClaim.session.hand?.seats.length, 2);
     assert.equal(carolClaim.session.hand?.seats.some((s) => s.seatNumber === 2), false);
-
-    const fundCarol = await fetch(`${gateway.url}/api/sessions/${setup.code}/seats/2/ledger`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-host-token": setup.hostToken },
-      body: JSON.stringify({ kind: "BUY_IN", amountChips: 500 }),
-    });
-    assert.equal(fundCarol.status, 201);
 
     // Host proxies Seat 1 raise to 60, then proxies Seat 4 Fold -> immediate Fold-Win!
     const proxyRaise = await submitAction(
@@ -612,43 +569,40 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
   });
 
   it("handles All-In uncalled excess return, short All-In non-reopening, and odd-Chip Showdown splits left of Button", async () => {
-    // 1. Short All-In non-reopening test (3 players: Seat 1=500, Seat 3=500, Seat 5=70)
+    // 1. Short All-In non-reopening test: start with 500 each, drop Carol (Seat 5) to 70 via Hand 1
     const setupShort = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 10, bigBlind: 20, smallestChipStep: 5, minBuyInChips: null },
+      { seatCount: 6, startingStackChips: 500, smallBlind: 10, bigBlind: 20 },
       [
-        { seatNumber: 1, displayName: "Alice", chips: 500 },
-        { seatNumber: 3, displayName: "Bob", chips: 500 },
-        { seatNumber: 5, displayName: "Carol", chips: 70 },
+        { seatNumber: 1, displayName: "Alice" },
+        { seatNumber: 3, displayName: "Bob" },
+        { seatNumber: 5, displayName: "Carol" },
       ],
     );
     await startHand(gateway.url, setupShort.code, setupShort.hostToken);
-    // Button=1, SB=3, BB=5 (Carol posted 20, 50 left)
-    // Seat 1 (Button) raises to 60 (+40 increment)
-    assert.equal(
-      (
-        await submitAction(
-          gateway.url,
-          setupShort.code,
-          { "x-seat-token": setupShort.seats[1]!.seatToken },
-          { action: "RAISE", amountChips: 60 },
-        )
-      ).status,
-      200,
-    );
-    // Seat 3 (SB) calls 60
+    // Hand 1 (Button=1, SB=3, BB=5): Alice(1) raises to 430, Bob(3) folds, Carol(5) calls 430 -> Flop: Carol checks, Alice bets 20, Carol folds -> Carol=70!
+    await submitAction(gateway.url, setupShort.code, { "x-seat-token": setupShort.seats[1]!.seatToken }, { action: "RAISE", amountChips: 430 });
+    await submitAction(gateway.url, setupShort.code, { "x-seat-token": setupShort.seats[3]!.seatToken }, { action: "FOLD" });
+    await submitAction(gateway.url, setupShort.code, { "x-seat-token": setupShort.seats[5]!.seatToken }, { action: "CALL" });
+    await submitAction(gateway.url, setupShort.code, { "x-seat-token": setupShort.seats[5]!.seatToken }, { action: "CHECK" });
+    await submitAction(gateway.url, setupShort.code, { "x-seat-token": setupShort.seats[1]!.seatToken }, { action: "BET", amountChips: 20 });
+    await submitAction(gateway.url, setupShort.code, { "x-seat-token": setupShort.seats[5]!.seatToken }, { action: "FOLD" });
+
+    // Hand 2: Button=3 (Bob), SB=5 (Carol=70 total), BB=1 (Alice)
+    await startHand(gateway.url, setupShort.code, setupShort.hostToken);
+    // Seat 3 (Button) raises to 60 (+40 increment)
     assert.equal(
       (
         await submitAction(
           gateway.url,
           setupShort.code,
           { "x-seat-token": setupShort.seats[3]!.seatToken },
-          { action: "CALL" },
+          { action: "RAISE", amountChips: 60 },
         )
       ).status,
       200,
     );
-    // Seat 5 (BB, 70 total) goes All-In for 70 (+10 short all-in < 40 min increment!)
+    // Seat 5 (SB, 70 total) goes All-In for 70 (+10 short all-in < 40 min increment!)
     const shortAllInRes = await submitAction(
       gateway.url,
       setupShort.code,
@@ -660,16 +614,7 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     assert.equal(afterShort.hand.currentBet, 70);
     assert.equal(afterShort.hand.actingSeatNumber, 1);
 
-    // Seat 1 already acted on the 60 raise; short all-in of +10 does NOT reopen raising for Seat 1!
-    const blockedReopen = await submitAction(
-      gateway.url,
-      setupShort.code,
-      { "x-seat-token": setupShort.seats[1]!.seatToken },
-      { action: "RAISE", amountChips: 120 },
-    );
-    assert.equal(blockedReopen.status, 409);
-
-    // Seat 1 calls 10 -> Seat 3 calls 10 -> Flop (Pot = 210)
+    // Seat 1 calls 70 -> returns to Seat 3 (who already acted on the 60 raise; +10 short all-in does NOT reopen raising for Seat 3!)
     assert.equal(
       (
         await submitAction(
@@ -681,6 +626,15 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
       ).status,
       200,
     );
+    const blockedReopen = await submitAction(
+      gateway.url,
+      setupShort.code,
+      { "x-seat-token": setupShort.seats[3]!.seatToken },
+      { action: "RAISE", amountChips: 120 },
+    );
+    assert.equal(blockedReopen.status, 409);
+
+    // Seat 3 calls 10 -> Flop (Pot = 210)
     const callShort2 = await submitAction(
       gateway.url,
       setupShort.code,
@@ -690,26 +644,31 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     assert.equal(callShort2.status, 200);
     assert.equal(((await callShort2.json()) as { hand: HandState }).hand.street, "FLOP");
 
-    // 2. Heads-Up All-In unequal stacks + odd-Chip Showdown split (step=1, odd Pot=101)
+    // 2. Heads-Up All-In unequal stacks + odd-Chip Showdown split (odd Pot=101)
     const setupOdd = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 1, bigBlind: 2, smallestChipStep: 1 },
+      { seatCount: 6, startingStackChips: 300, smallBlind: 1, bigBlind: 2 },
       [
-        { seatNumber: 2, displayName: "Alice", chips: 100 },
-        { seatNumber: 5, displayName: "Bob", chips: 500 },
+        { seatNumber: 2, displayName: "Alice" },
+        { seatNumber: 5, displayName: "Bob" },
       ],
     );
-    // Start Hand 1 (Button=2, SB=2, BB=5). Wait: let's bet to create an odd pot of 101!
-    // Preflop: Seat 2 calls 1 (total 2), Seat 5 checks -> Flop (Pot 4).
-    // Flop: Seat 5 bets 49 (2+49=51?), no: to make Pot = 101, Seat 5 needs 50+51 -> wait, two players must match 50.5?
-    // An odd pot requires 3 players (e.g. folded SB)! Let's test 3 players!
+    // Drop Alice (Seat 2) from 300 -> 100 in Hand 1 (Bob=500)
+    await startHand(gateway.url, setupOdd.code, setupOdd.hostToken);
+    await submitAction(gateway.url, setupOdd.code, { "x-seat-token": setupOdd.seats[2]!.seatToken }, { action: "RAISE", amountChips: 200 });
+    await submitAction(gateway.url, setupOdd.code, { "x-seat-token": setupOdd.seats[5]!.seatToken }, { action: "CALL" });
+    await submitAction(gateway.url, setupOdd.code, { "x-seat-token": setupOdd.seats[5]!.seatToken }, { action: "BET", amountChips: 10 });
+    await submitAction(gateway.url, setupOdd.code, { "x-seat-token": setupOdd.seats[2]!.seatToken }, { action: "FOLD" });
+
+    // Play a quick Fold-Win Hand 2 (Button=5 folds -> Seat 2=101, Seat 5=499) -> wait, let's just test uncalled excess from Hand 2 (Button=5, BB=2, 100 vs 500)!
+    // Actually on Hand 2 Button=5(499), BB=2(101): Seat 5 calls 2, Seat 2 checks? No: Seat 5 ALL_IN (499), Seat 2 CALL (101)! Uncalled 398 returned!
     const setupOdd3 = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 1, bigBlind: 2, smallestChipStep: 1 },
+      { seatCount: 6, startingStackChips: 200, smallBlind: 1, bigBlind: 2 },
       [
-        { seatNumber: 1, displayName: "Alice", chips: 200 },
-        { seatNumber: 3, displayName: "Bob", chips: 200 },
-        { seatNumber: 5, displayName: "Carol", chips: 200 },
+        { seatNumber: 1, displayName: "Alice" },
+        { seatNumber: 3, displayName: "Bob" },
+        { seatNumber: 5, displayName: "Carol" },
       ],
     );
     // Button=1, SB=3 (posts 1), BB=5 (posts 2)
@@ -799,37 +758,19 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     assert.equal(getSeatChips(split.session, 1), 200); // 200 - 50 + 50
     assert.equal(getSeatChips(split.session, 3), 199); // 200 - 1
 
-    // 3. Heads-Up unequal All-In returns uncalled excess
+    // 3. Heads-Up unequal All-In returns uncalled excess (Alice=100, Bob=500, Button=5)
     await startHand(gateway.url, setupOdd.code, setupOdd.hostToken);
-    // Button=2 (SB=1, stack 99), BB=5 (BB=2, stack 498)
-    // Seat 2 goes All-In for 100, Seat 5 calls? No, test Seat 5 shoving 500 over Seat 2's call!
-    assert.equal(
-      (
-        await submitAction(
-          gateway.url,
-          setupOdd.code,
-          { "x-seat-token": setupOdd.seats[2]!.seatToken },
-          { action: "CALL" },
-        )
-      ).status,
-      200,
-    );
-    assert.equal(
-      (
-        await submitAction(
-          gateway.url,
-          setupOdd.code,
-          { "x-seat-token": setupOdd.seats[5]!.seatToken },
-          { action: "ALL_IN" },
-        )
-      ).status,
-      200,
+    await submitAction(
+      gateway.url,
+      setupOdd.code,
+      { "x-seat-token": setupOdd.seats[5]!.seatToken },
+      { action: "ALL_IN" },
     );
     const callAllInRes = await submitAction(
       gateway.url,
       setupOdd.code,
       { "x-seat-token": setupOdd.seats[2]!.seatToken },
-      { action: "ALL_IN" },
+      { action: "CALL" },
     );
     assert.equal(callAllInRes.status, 200);
     const allInShowdown = (await callAllInRes.json()) as { hand: HandState; session: SessionSnapshot };
@@ -848,7 +789,7 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
   it("persists mid-Hand SQLite state, turn, pot, and Button history across gateway restarts", async () => {
     const setup = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 10, bigBlind: 20, smallestChipStep: 5 },
+      { seatCount: 6, smallBlind: 10, bigBlind: 20 },
       [
         { seatNumber: 1, displayName: "Alice", chips: 1000 },
         { seatNumber: 3, displayName: "Bob", chips: 1000 },
@@ -974,15 +915,15 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     assert.equal(hand2.hand.buttonSeatNumber, 3);
   });
 
-  it("handles step-aligned odd-Chip splits, seated Host proxy vs own Seat, and bust-then-Rebuy between Hands", async () => {
-    // Step=5 odd-Chip Showdown split: Pot = 45 split between BTN (Seat 1) and BB (Seat 5) -> 25 to Seat 5, 20 to Seat 1
+  it("handles whole-Chip odd-Chip splits, seated Host proxy vs own Seat, and bust blocking next Hand", async () => {
+    // Whole-Chip odd-Chip Showdown split: Pot = 45 split between BTN (Seat 1) and BB (Seat 5) -> 23 to Seat 5, 22 to Seat 1
     const setupStep = await createFundedSession(
       gateway.url,
-      { seatCount: 6, smallBlind: 5, bigBlind: 10, smallestChipStep: 5, minBuyInChips: 100 },
+      { seatCount: 6, startingStackChips: 200, smallBlind: 5, bigBlind: 10 },
       [
-        { seatNumber: 1, displayName: "HostSeat", chips: 200 },
-        { seatNumber: 3, displayName: "Bob", chips: 200 },
-        { seatNumber: 5, displayName: "Carol", chips: 200 },
+        { seatNumber: 1, displayName: "HostSeat" },
+        { seatNumber: 3, displayName: "Bob" },
+        { seatNumber: 5, displayName: "Carol" },
       ],
     );
     const start1 = (await (await startHand(gateway.url, setupStep.code, setupStep.hostToken)).json()) as {
@@ -1073,17 +1014,17 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     const splitStepRes = await resolveShowdownReq(gateway.url, setupStep.code, setupStep.hostToken, [1, 5]);
     assert.equal(splitStepRes.status, 200);
     const splitStep = (await splitStepRes.json()) as { hand: HandState; session: SessionSnapshot };
-    assert.equal(getSeatChips(splitStep.session, 5), 205); // 200 - 20 + 25
-    assert.equal(getSeatChips(splitStep.session, 1), 200); // 200 - 20 + 20
+    assert.equal(getSeatChips(splitStep.session, 5), 203); // 200 - 20 + 23
+    assert.equal(getSeatChips(splitStep.session, 1), 202); // 200 - 20 + 22
     assert.equal(getSeatChips(splitStep.session, 3), 195); // 200 - 5
 
-    // Bust-then-Rebuy flow in Heads-Up
+    // Bust blocking next Hand in Heads-Up
     const setupBust = await createFundedSession(
       gateway.url,
-      { seatCount: 4, smallBlind: 10, bigBlind: 20, smallestChipStep: 5, minBuyInChips: 100, maxBuyInChips: 1000 },
+      { seatCount: 4, startingStackChips: 100, smallBlind: 10, bigBlind: 20 },
       [
-        { seatNumber: 1, displayName: "Alice", chips: 100 },
-        { seatNumber: 2, displayName: "Bob", chips: 100 },
+        { seatNumber: 1, displayName: "Alice" },
+        { seatNumber: 2, displayName: "Bob" },
       ],
     );
     await startHand(gateway.url, setupBust.code, setupBust.hostToken);
@@ -1091,21 +1032,8 @@ describe("Core No-Limit Hold'em Hand Loop & Single-Pot Showdown", () => {
     await submitAction(gateway.url, setupBust.code, { "x-seat-token": setupBust.seats[2]!.seatToken }, { action: "CALL" });
     await resolveShowdownReq(gateway.url, setupBust.code, setupBust.hostToken, [2]);
 
-    // Alice is at 0 Chips -> cannot start Hand 2 until she Rebuys!
+    // Alice is at 0 Chips -> cannot start Hand 2 with only 1 funded Seat
     const blockedStart = await startHand(gateway.url, setupBust.code, setupBust.hostToken);
     assert.equal(blockedStart.status, 409);
-
-    const rebuyAlice = await fetch(`${gateway.url}/api/sessions/${setupBust.code}/seats/1/ledger`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-host-token": setupBust.hostToken },
-      body: JSON.stringify({ kind: "REBUY", amountChips: 200 }),
-    });
-    assert.equal(rebuyAlice.status, 201);
-
-    const hand2Ok = await startHand(gateway.url, setupBust.code, setupBust.hostToken);
-    assert.equal(hand2Ok.status, 201);
-    const hand2State = (await hand2Ok.json()) as { hand: HandState };
-    assert.equal(hand2State.hand.handNumber, 2);
-    assert.equal(hand2State.hand.buttonSeatNumber, 2);
   });
 });

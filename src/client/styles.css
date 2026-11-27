@@ -257,27 +257,6 @@ body {
   min-width: 0;
 }
 
-.ledger-stats {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.ledger-stat {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  padding: 10px 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-
-.ledger-stat strong {
-  font-size: 0.94rem;
-}
-
 .chip-slider {
   padding: 0 !important;
   accent-color: var(--accent);
@@ -292,16 +271,6 @@ body {
 
 .inline-row input {
   flex: 1;
-}
-
-.deal-prompt-banner {
-  background: rgba(52, 211, 153, 0.12);
-  border: 1px solid rgba(52, 211, 153, 0.45);
-  color: var(--text);
-  border-radius: 10px;
-  padding: 10px 12px;
-  margin-bottom: 10px;
-  font-size: 0.9rem;
 }
 
 .turn-banner {
@@ -371,85 +340,10 @@ body {
   border-radius: 10px;
 }
 
-.settlement-subheading {
-  margin: 0 0 8px;
-  font-size: 0.9rem;
-  color: var(--muted);
-}
-
-.settlement-transfer-card {
-  border-color: rgba(52, 211, 153, 0.35);
-}
-
 .net-positive {
   color: var(--accent);
 }
 
 .net-negative {
   color: var(--danger);
-}
-
-.cashout-action-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  margin-top: 12px;
-  padding-top: 12px;
-  border-top: 1px solid var(--border);
-}
-
-.toggle-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-bottom: 12px;
-}
-
-.toggle-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  font-size: 0.9rem;
-  cursor: pointer;
-}
-
-.toggle-row input[type="checkbox"] {
-  width: 18px;
-  height: 18px;
-  margin: 0;
-  accent-color: var(--accent);
-  flex-shrink: 0;
-}
-
-.hand-history-card {
-  flex-direction: column;
-  align-items: stretch;
-}
-
-.history-detail {
-  width: 100%;
-  margin-top: 8px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.history-section {
-  display: flex;
-  flex-direction: column;
-}
-
-.history-action-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
 }

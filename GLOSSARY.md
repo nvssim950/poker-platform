@@ -1,57 +1,47 @@
 # Poker Platform
 
-A tabletop chip and pot accounting domain for No-Limit Texas Hold'em cash games played with physical cards.
+A casual tabletop chip and pot companion for No-Limit Texas Hold'em played with physical cards and play Chips.
 
 ## Language
 
-### Session & Ledger
+### Session & Standings
 
 **Session**:
-A single No-Limit Texas Hold'em cash-game gathering played with physical cards, from opening the ledger to final **Settlement**.
+A single No-Limit Texas Hold'em gathering played with physical cards and play Chips, from opening the table to final **End Game** standings.
 _Avoid_: Match, event
 
 **Player**:
-A participant seated in a **Session** who holds **Chips**, acts in **Hands**, and settles on the ledger.
+A participant seated in a **Session** who holds **Chips** and acts in **Hands**.
 _Avoid_: User, account, member
 
 **Chip**:
-A unit of virtual wagering value used during a **Session**, pegged to a **Cash** exchange rate.
+A unit of virtual play-only wagering value used during a **Session**.
 _Avoid_: Point, coin, credit
 
-**Cash**:
-Real-world currency value tracked on the **Session** ledger for **Buy-In**s and **Settlement**, never processed as payments.
-_Avoid_: Money, real money, bankroll
-
 **Host**:
-The **Player** or organizer who creates a **Session**, configures its table rules, manages the ledger, and can act on behalf of any **Seat**.
+The **Player** or organizer who creates a **Session**, configures Starting Stack and Blinds, starts **Hands**, resolves **Showdowns**, and can act as a proxy for any **Seat**.
 _Avoid_: Admin, moderator, banker
 
 **Seat**:
 A numbered table position in a **Session** that can be open, occupied by an active **Player**, or sitting out.
 
-**Release**:
-A **Host** action that vacates an occupied **Seat** back to open and revokes its **Player** reconnect token.
-
-**Re-link**:
-A **Host** action that revokes a seated **Player**'s current reconnect token and issues a one-time transfer link so the **Player** can reclaim their **Seat** on another device.
-
-**Buy-In**:
-A recorded acquisition of **Chips** by a **Player** during a **Session**, adding to their **Cash** obligation on the ledger.
-_Avoid_: Deposit, load
+**Starting Stack**:
+The fixed number of **Chips** automatically granted to a **Player** when claiming an open **Seat**.
 
 **Rebuy**:
-A **Buy-In** taken between **Hands** by a **Player** whose stack is zero **Chips**.
+An instant self-service refill of the **Starting Stack** taken between **Hands** by a **Player** whose stack is zero **Chips**, with no **Host** approval required.
 
-**Top-Up**:
-A **Buy-In** taken between **Hands** by an active **Player** to raise a non-zero stack up to the **Session** maximum.
-_Avoid_: Add-on
+**Leave**:
+A **Player** action between **Hands** that vacates their **Seat** back to open while snapshotting their final **Chip** standing on the **Leaderboard**.
 
-**Cash-Out**:
-The locking of an exiting **Player**'s remaining **Chip** stack mid-**Session**, fixing their ending position for **Settlement**.
+**Release**:
+A **Host** action between **Hands** that removes a **Player** from an occupied **Seat**, vacates it back to open, and snapshots their final **Chip** standing on the **Leaderboard**.
 
-**Settlement**:
-The end-of-**Session** calculation of net **Cash** owed between **Players** from total **Buy-In**s versus ending **Chip** stacks.
-_Avoid_: Payout, reconciliation
+**Leaderboard**:
+The live or final ranking of all **Session** participants (active and departed) by net **Chips** (`endingChips - totalIssuedChips`), current **Chips**, and **Rebuy** count.
+
+**End Game**:
+The **Host** action between **Hands** that closes the **Session** and locks the final **Leaderboard**.
 
 ### Hand & Betting
 
@@ -62,12 +52,6 @@ _Avoid_: Round, game
 **Button**:
 The rotating dealer position in a **Hand** that determines blind order, acting order, and odd-chip tie-breaking priority.
 _Avoid_: Dealer
-
-**Ante**:
-A forced pre-deal **Chip** contribution posted before cards are dealt into the **Main Pot**, either by every **Seat** or by the big blind **Seat**.
-
-**Straddle**:
-An optional voluntary blind wager posted before cards are dealt that increases the effective stake and reopens preflop raising for the straddling **Seat**.
 
 **Street**:
 One betting phase within a **Hand**: Preflop, Flop, Turn, or River.
@@ -88,6 +72,3 @@ An additional **Pot** formed when an all-in **Player** cannot match further wage
 
 **Showdown**:
 The resolution of a **Hand** when two or more **Players** remain after the final **Street**, where winning **Players** for each **Pot** are declared directly rather than evaluated from card rankings.
-
-**Run It Twice**:
-An optional all-in agreement that splits each contested **Pot** into two independent **Showdown** halves, each resolved separately.
